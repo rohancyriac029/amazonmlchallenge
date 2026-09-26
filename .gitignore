@@ -1,0 +1,12 @@
+# Allow-list: track only the pipeline code and the methodology documentation.
+/*
+!/.gitignore
+!/Documentation_template.md
+!/code/
+/code/*
+!/code/business_entity_resolution/
+# never track caches or ad-hoc EC2 job-queue scripts
+__pycache__/
+*.pyc
+*.sh
+.DS_Store

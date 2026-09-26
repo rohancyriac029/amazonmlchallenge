@@ -1,0 +1,460 @@
+# ML Challenge 2026: Business Entity Resolution Solution
+
+**Team Name:** [Your Team Name]  
+**Team Members:** [List all team members]  
+**Submission Date:** 2026-09-26
+
+---
+
+## 1. Executive Summary
+
+We built a blocking + learned-matching pipeline with three stages:
+
+1. **Retrieval.** Multi-channel sparse TF-IDF retrieval, blocked by country.
+2. **Stage-1 ranker.** Prunes candidates to 25 per Source-1 entity.
+3. **Two LightGBM pair classifiers.** Stage 2 scores each pair. Stage 3 re-scores pairs using set-level evidence: sibling agreement between candidates, and competition between S1 entities for the same record.
+
+A precision-first set-selection rule turns scores into matches. It maximises expected F0.5, gates out weak entities, and enforces that each S2/S3 record belongs to at most one S1 (a structural fact we measured in the ground truth).
+
+Key techniques:
+
+- rule-based Indic→Latin transliteration, plus a translation dictionary learned from training pairs
+- name×locality conjunction blocking keys
+- stacking with graph-style consistency features
+- pseudo-label adaptation for countries that are unseen in training (France)
+
+The final model (**v2**) is additionally made **robust to dataset shift**. A train-vs-test domain classifier showed that features encoding the *composition* of a dataset do not transfer to test. These are raw name-frequency counts, raw competition gaps between S1 entities, and the stage-1 score that folds both in. Stage 2 drops them and uses country-relative IDF-weighted similarities instead. Competition between S1 entities is re-introduced only in stage 3, through probabilities.
+
+Results:
+
+| | v1 | v2 | **v3 + threshold 0.9 (final)** |
+|---|---|---|---|
+| Public leaderboard (macro F0.5) | 0.960 | 0.974 | **0.975** |
+| Holdout fold (training distribution) | 0.9840 | 0.9841 | 0.9810 |
+| Dev 4-fold OOF | 0.9830 ± 0.0001 | 0.9833 ± 0.0001 | 0.9808 (fold 4 only)* |
+
+\* v3's expected-F rule scores 0.9828 on the full 4-fold dev. The thr-0.9 figure is dev fold 4 (the E1 clean set). The 0.9 threshold deliberately trades in-distribution recall for robustness to near-copy distractors (§5.6). v3 with the v2 rule also scored 0.974 on the leaderboard.
+
+---
+
+## 2. Methodology
+
+### 2.1 Problem Analysis (EDA on all 25M records)
+
+| | train S1 | train S2 | train S3 | test S1 | test S2 | test S3 |
+|---|---|---|---|---|---|---|
+| rows | 2,206,821 | 5,034,616 | 5,285,603 | 1,732,544 | 4,887,273 | 5,082,316 |
+| countries | US 60%, India 40% | same | same | India 47%, US 38%, **France 15%** | | |
+| empty address | 0% | 3.4% | 3.3% | 0% | 2.7% | 2.7% |
+| non-ASCII names | 0% | 15.2% | 11.5% | 2.4% | 19.0% | 14.5% |
+
+Ground-truth structure (train):
+
+- **Singletons: 5.58%** of S1 have no match (US 5.58%, India 5.59%). The mean number of matches is 3.46; the full distribution is 0: 123k, 1: 119k, 2: 375k, 3: 531k, 4: 484k, 5: 322k, 6+: 252k (max 11).
+- There are 3.69M S1→S2 and 3.94M S1→S3 links. 80.5% of S1 match both sources, 6.5% only S2, 7.5% only S3.
+- **Each S2/S3 record belongs to at most one S1.** Of 7.64M matched records, 0 map to more than one S1. We exploit this as an exclusivity constraint.
+- **Country always agrees** on true pairs (100.000%), so blocking by exact country string is lossless. Country is treated as an open set.
+- **26% of S2/S3 records match no S1** (1.34M per source). They act as distractors, and some are near-exact copies of an S1 record.
+- Name ambiguity is severe: there are only 1.54M distinct names among 2.2M S1. For example, "The Dent Tattoo" is 73 different S1 businesses, and 36% of S1 share their normalized name with another S1. Name-only evidence is therefore weak, and address/locality is essential.
+- Exact raw name equality holds for only 6–14% of true pairs, and exact address equality for 4–11%.
+
+Noise patterns observed:
+
+- **Names:**
+  - written in Devanagari, Tamil, Telugu, Kannada, Bengali, Gujarati, Malayalam, Gurmukhi or Oriya, including legal suffixes (प्राइवेट लिमिटेड) and spelled-out acronyms (एलएलपी = "L-L-P")
+  - typos and leetspeak ("5even", "Ne0tech", "Fami1y")
+  - legal-suffix add/drop/reorder, filler words ("Services", "Center", "Group")
+  - website domains ("maurewilliamscolombier.com"), DBA aliases and fully unrelated trade names that share only the address
+  - phone numbers and bracketed tokens
+- **Addresses:**
+  - reordered components, abbreviations (St/Street/Saint, Rd, Ave)
+  - wrong ordinals ("45ND")
+  - leading-zero numbers ("AF-0684" vs "Af-684"), "null"/"<NULL>"/"N/A" tokens
+  - state names in local script, district vs city substitutions
+  - truncated or altered house numbers
+  - French test data additionally has "N°", "R.", "BD.", "bis", and departments instead of regions.
+
+### 2.2 Solution Strategy
+
+**Approach Type:** Blocking + two-stage learned classifier + graph/set-level stacking + precision-first set selection (hybrid).
+
+**Core Innovations:**
+1. **Name×locality conjunction retrieval channel** (hashed TF-IDF). This is the single best blocking channel (top-30 recall 0.960). It resolves the "common name + common city" ambiguity that defeats both name-only and address-only retrieval.
+2. **Stage-3 set-level stacking.** A candidate is re-scored using its similarity to the S1's other confident candidates (records of one business corroborate each other) and the best probability any *other* S1 has for the same record. Gain: **+0.0045 macro F0.5 (paired-bootstrap 95% CI [+0.0044, +0.0046])**.
+3. **Exclusivity-aware expected-F0.5 set selection** with a singleton gate.
+4. **Validated unseen-country adaptation** via confident pseudo-labels, for France.
+
+---
+
+## 3. Candidate Generation (Blocking)
+
+**Normalization (several representations per record; `normalization.py`)**
+
+- **Names.** The pipeline builds conservative, core, sorted, compact and phonetic-skeleton forms, plus legal-form and digit tokens:
+  - *Conservative*: Unicode NFKD, accent stripping, lowercase, punctuation → space.
+  - *Core*: legal forms canonicalised (ltd/limited, pvt/private, inc, corp, llc, llp, sarl, sas, …) and removed, along with generic fillers.
+  - *Sorted*: core tokens in sorted order.
+  - *Compact*: core without spaces, which handles domains and spacing.
+  - *Phonetic skeleton*: consonant skeleton with voicing merged, for Tamil-style transliteration and vowel typos.
+  - Legal-form set and digit tokens are kept separately.
+  - Leetspeak is repaired inside mixed alphanumeric tokens, and `@handles`, `www`/`.com` are stripped.
+- **Indic transliteration.** One offset table covers all nine ISCII-derived Unicode blocks, which share a layout. It handles inherent vowels, virama, final-schwa deletion (kept after y/r/v conjuncts), and schwa deletion before independent vowels. Spelled-out acronyms are decoded by dynamic programming over English letter names ("elelpi" → "llp", "eses" → "ss").
+- **Learned transliteration dictionary.** From true pairs in the training folds only (fold 0 excluded), tokens are aligned by Jaro-Winkler, giving 530 entries such as venchars→ventures, entarapraijes→enterprises, solyushans→solutions.
+- **Addresses.** Canonical abbreviations (US, Indian and French street types), null-token removal, ordinal and number-word normalisation ("Tenth" → 10), leading-zero stripping, and alphanumeric splitting ("1056c" → 1056 c). Derived fields: word set, number set, first (house) number, 5–6 digit postal/PIN codes and component count.
+
+**Retrieval channels** (`blocking.py`). All channels use hashed features (2^26 buckets), TF-IDF with IDF over query+pool, drop features with df > 10,000, L2-normalise, and take top-K by sparse dot product (`sparse_dot_topn`, 8 threads). Blocking is by exact country.
+
+| Channel | Features | K | Top-30 recall |
+|---|---|---|---|
+| name | core tokens, skeleton tokens, token bigrams, compact prefix/suffix/full | 30 | 0.653 |
+| addr | address words, numbers, number+word and word bigrams | 30 | 0.852 |
+| combo | name ⊕ address (0.5/0.5) | 30 | 0.920 |
+| **conj** | name-token × address-word / number conjunctions (+0.2 name, +0.2 addr) | 30 | **0.960** |
+| gram | character 4-grams of the compact name (typos) | 20 | 0.679 |
+| **union** | | ≈79/S1 | **0.9813** |
+
+- **Stage-1 ranker** (`ranker1.py`). A LightGBM (200 trees) over the five channel scores and their within-S1 rank, max and gap, and within-record rank and gap. It is trained out-of-fold. It keeps the top 25 per S1 and retains 99.98% of retrieved true pairs (top-10 already keeps 99.94%).
+- **Candidate pairs generated:** 174.0M retrieved → **55.2M** after stage 1 on train (25 per S1), with a reduction ratio of 0.9999924. The test set has 43.3M final candidate pairs (`candidate_pairs.tsv`) — see §5.3.
+- **How true matches were kept:**
+  - Channels were designed from miss analysis: common-locality misses led to the conjunction channel, typos to character n-grams, transliteration to the skeleton and dictionary.
+  - Recall was measured per channel and for the union.
+  - `max_df` was chosen on a recall/cost sweep (3k/10k/30k).
+  - The final candidate recall is **0.9811 (dev), 0.9814 (holdout)**.
+
+---
+
+## 4. Matching Model
+
+**Features used** (v1 stage 2: 89 features; `features.py`).
+
+> **Final model (v2):** stage 2 uses 78 features. That is this list *minus* the raw ambiguity counts, the raw competition gaps/ranks and the stage-1 score/rank, *plus* 10 country-relative IDF-weighted similarities. Stage 3 adds 19 stacking features (97 in total). See §5.5 for why.
+
+- **Name features:**
+  - RapidFuzz ratio, token-sort and token-set on the core form
+  - partial ratio, Jaro-Winkler and normalised Levenshtein on the compact form
+  - skeleton ratio and conservative-form ratio
+  - token Jaccard and containment (core, skeleton and conservative sets)
+  - compact equality and containment, first-token equality
+  - token counts, length ratio
+  - legal-form Jaccard, digit-token equality
+- **Address features:**
+  - ratio, token-set, token-sort and partial ratio on the normalised address
+  - word Jaccard and containment, number Jaccard and containment
+  - first-number equality, and each side's house number contained in the other's numbers
+  - postal/PIN equality, best numeric edit similarity
+  - word and number counts
+  - name appearing inside the address
+- **Retrieval context:** all five channel cosines, with rank, max and gap within the S1, rank and gap within the pool record, candidate counts, and the stage-1 score and rank.
+- **Ambiguity statistics (unsupervised):** how many S1 records and pool records share the normalised name, the name + house number, or the address.
+- **Flags:** domain-name, DBA, phone-in-name, Indic-script, empty address (both sides), component counts, source (S2/S3).
+- **Country is deliberately *not* a feature**, so France uses the same model.
+
+**Stage 3 (set-level / graph stacking; `stack.py`).** Stage-2 out-of-fold probabilities feed 19 extra features:
+
+- **S1 profile:** rank, max, gap and sum of P within the S1; number of candidates with P ≥ 0.5 and P ≥ 0.9.
+- **Competition:** best P of any other S1 for the same record, rank within the record, and the number of confident S1 claimants.
+- **Sibling support:** against the S1's other confident candidates (up to 6), the maximum and mean name/address token-set similarity, the maximum of min(name, address), a P-weighted version, same house number, and same source.
+
+**Model type:** LightGBM binary GBDT with 127 leaves, learning rate 0.08, 600 rounds, feature/bagging fraction 0.8 (MIT licence, trained from scratch, about 2×10⁵ learned split/leaf values; far below the 8B limit). No pretrained or external model is used.
+
+**Threshold / decision selection** (`decision.py`, chosen on dev folds only):
+
+1. **Exclusivity:** each S2/S3 record is kept only for its highest-scoring S1. On the base model: +0.0013 (0.9762 → 0.9775 at threshold 0.5).
+2. **Expected-F0.5 prefix selection per S1:** candidates are sorted by P, and the prefix k maximising 1.25·ΣP₁..ₖ / (k + 0.25·(ΣP + 0.3)) is chosen. The empty set is chosen when Π(1−P) is larger.
+3. **Singleton gate:** the prediction is empty unless the best P ≥ 0.6.
+
+We compared thresholds 0.3–0.95, expected-F with miss-mass 0/0.3/0.6 and floors 0–0.8, and gates 0.6–0.95. All policies fall within 0.9824–0.9830, so the decision layer is robust, and we picked the best (expF, gate 0.6).
+
+---
+
+## 5. Results & Error Analysis
+
+### 5.1 Validation protocol
+
+- **Folds:** assigned per S1 with md5(id) % 5.
+- **Fold 0 is an untouched final holdout** (442,303 S1). It was excluded from the transliteration dictionary, from every model, feature, threshold and policy choice, and from the error analysis. It was scored exactly once, after the configuration was frozen.
+- **Development:** 4-fold OOF on folds 1–4 (1,764,518 S1). We report pooled macro F0.5, per-fold mean and std, and paired bootstrap confidence intervals over S1 entities.
+- **All S1 are always queried** during blocking, so within-record competition features and exclusivity see realistic density. No labels of an evaluated fold ever enter its features.
+- **Our `evaluate_predictions`** reproduces the competition metric exactly: per-S1 F0.5, singletons score 1 or 0, macro average.
+
+### 5.2 Ablation / experiment log (dev folds, 4-fold OOF)
+
+| Experiment | Blocking | Model | Policy | Macro F0.5 | P | R | Singleton acc | Fold std |
+|---|---|---|---|---|---|---|---|---|
+| base, no exclusivity | 5-ch + stage-1 top-25 | LGBM stage 2 | thr 0.5 | 0.9762 | 0.9844 | 0.9619 | 0.951 | 0.0001 |
+| base | same | LGBM stage 2 | thr 0.5 + excl. | 0.9775 | 0.9863 | 0.9608 | 0.958 | 0.0002 |
+| base | same | LGBM stage 2 | thr 0.7 + excl. | 0.9785 | 0.9901 | 0.9527 | 0.977 | 0.0001 |
+| base | same | LGBM stage 2 | expF (miss 0.3) | 0.9785 | 0.9902 | 0.9531 | 0.954 | 0.0001 |
+| **stack1** | same | **+ stage 3 stacking** | thr 0.7 | 0.9828 | 0.9915 | 0.9626 | 0.984 | 0.0002 |
+| **stack1** | same | + stage 3 stacking | **expF + gate 0.6** | **0.9830** | 0.9918 | 0.9627 | 0.978 | 0.0001 |
+
+- **Stacking vs. base:** paired bootstrap Δ = **+0.00448** [95% CI +0.00440, +0.00456].
+- **Blocking ablation** (recall on a 40k-S1 sample):
+  - name + addr + combo only: 0.9749 (US) / 0.9503 (India)
+  - adding the conjunction and n-gram channels and the normalisation fixes: **0.9830 / 0.9786**
+- **Stage-1 pruning:** learned ranker top-25 keeps 99.98% of retrieved positives, vs. max-reciprocal-rank fusion top-25 at 99.1%.
+
+**Leave-one-country-out** (proxy for unseen France; stage 2 only; macro F0.5 on the held-out country):
+
+| Train on → score on | Source-only | + pseudo-label adaptation | In-distribution reference |
+|---|---|---|---|
+| US → India | 0.9349 | **0.9404** (+0.0055) | 0.9750 |
+| India → US | 0.9660 | – | 0.9808 |
+
+The pseudo-labels on the unseen country were clean: positives at 0.990 precision and negatives at 0.9987 purity. We therefore apply the adaptation automatically to any test country absent from training.
+
+### 5.3 Final results
+
+- **Holdout (untouched, scored once), macro F0.5 = 0.9840:**
+  - precision 0.9927, recall 0.9637, singleton accuracy 0.9823, candidate recall 0.9814
+  - US 0.9855, India 0.9818
+  - S2 part 0.9777, S3 part 0.9765
+  - multi-match S1 0.9869, ambiguous-name S1 0.9776
+- **Dev OOF:** 0.9830 (fold std 0.0001).
+- **Test set, v1** (no labels; sanity statistics only):
+  - Candidates: 136.9M retrieved → 43.3M final (25 per S1) in `candidate_pairs.tsv`. France has 81 retrieved candidates per S1, the same density as US (75) and India (81).
+  - Predictions: 6,003,813 matches in total. Mean matches per S1: US 3.54, India 3.42, France 3.43. The predicted-empty (singleton) rate is 5.5%, 5.7% and 5.2% respectively, consistent with the 5.6% singleton rate seen in training.
+  - France (unseen) used pseudo-label adaptation: 6.49M pairs, 804,611 pseudo-positives and 5,289,559 pseudo-negatives.
+  - The official `utils/validate_submission.py`, including `--check-ids`, returns **PASS**.
+- **Test set, v2:**
+  - Same 43.3M candidates (`candidate_pairs.tsv` is byte-identical to v1).
+  - 5,795,489 matches. Matches per S1: US 3.40, India 3.36, France 3.17. Predicted-empty rate: 5.7%, 5.8% and 6.1% respectively.
+  - France adaptation: 750,103 pseudo-positives and 5,293,882 pseudo-negatives.
+  - Validator **PASS** with `--check-ids`.
+  - Public leaderboard **0.974**.
+- **Test set, final (v3 + threshold 0.9):**
+  - 5,743,719 matches. Matches per S1: US 3.36, India 3.31, France 3.22. Predicted-empty rate: 6.0%, 6.2% and 6.1% respectively.
+  - Validator **PASS** with `--check-ids`.
+  - Public leaderboard **0.975**.
+
+### 5.4 Error analysis (dev folds)
+
+Loss decomposition with oracles: the current score is 0.9785 (base), and a perfect classifier on our candidates would reach 0.9942.
+
+| Error source | Oracle gain |
+|---|---|
+| Rejected true pairs whose record has an address | +0.0068 |
+| Rejected true pairs whose record has no address | +0.0043 |
+| False merges onto records with **no** ground-truth owner | +0.0037 |
+| False merges onto records owned by another S1 | +0.0010 |
+| Blocking misses | 0.0058 |
+
+- **Common false positives (wrong merges):**
+  - 78% of false merges are onto S2/S3 records that the ground truth assigns to **no** S1, yet which are near-exact copies of the S1 ("Inc. Roos & Thompson Clinic | 23289 Aberdeen Court, Foley" for S1 "Roos & Thompson Clinic | 23289 Aberdeen Court, Foley, AL"). They include apparent singletons with an identical record in S3. These look like distractors or label noise and are essentially indistinguishable.
+  - The remainder are same-name branches with near-identical addresses (e.g. professional practices at "6721 Tower Drive" with a changed city).
+- **Common false negatives (missed matches):**
+  - (i) Records with an empty address whose name is shared by many S1 (name-only evidence cannot be trusted when "Bison PC" exists dozens of times).
+  - (ii) Altered house numbers on otherwise identical records ("1325" → "6325 Trailridge Rd"), which the model learned to treat as distractor-like.
+  - (iii) Unrelated trade names that share only the address ("Noviariax" at the S1 address).
+  - (iv) Indic-script names with partial addresses.
+  - Stage-3 stacking recovered a large part of (ii) and (iii) through sibling agreement: recall rose from 0.953 to 0.963 while false merges fell from 32.1k to 21.5k.
+
+## 5.5 Generalization to the test distribution (final model v2)
+
+**Symptom.** v1 scored 0.984 on our holdout but **0.960** on the public leaderboard.
+
+**Diagnosis.** Every step below used unlabeled test data only; nothing was tuned on test labels.
+
+1. **Country is not the cause.** Label-free confidence profiles show that France, US and India on test all have about 2× more uncertain candidates per S1 than the holdout (0.34–0.44 vs 0.20–0.22). The gap is test-wide, not France-specific.
+2. **Extra near-copies.** Test has about 0.6 more near-identical candidates per S1 (name ≥ 90 and address ≥ 85) than train, in every country. There are also 5.75 S2/S3 records per S1 in test vs 4.68 in train.
+3. **Direction check.** The same scores with a stricter 0.9 threshold scored **0.967** on the leaderboard. So v1 over-accepted on test.
+4. **Cause.** A train-vs-test **domain classifier** separates candidate pairs with AUC 0.88 (US) / 0.86 (India). Its top features are all *composition-dependent*:
+   - raw counts of how many records share a name, which fall from 32.6 to 17.1 for US
+   - raw competition gaps and counts between S1 entities for the same record
+   - the stage-1 score, which is built from them
+5. **Dropping them lowers the shift.**
+
+   | Feature set | Domain AUC, US | Domain AUC, India |
+   |---|---|---|
+   | full | 0.877 | 0.856 |
+   | − raw counts | 0.815 | 0.790 |
+   | − raw counts − competition | 0.750 | 0.728 |
+   | − counts − competition − stage-1 score | 0.673 | 0.634 |
+
+**What did not help** (measured, kept out):
+
+- **S1-dropout** simulating test density: +0.0005 on dense dev, −0.0002 on normal dev.
+- **A "smaller universe" simulation:** it made train *less* like test (domain AUC rose to 0.96).
+- **EM prior-shift correction:** it recovered the simulated prior exactly, but gained only +0.0001, because the problematic pairs are not low-probability ones.
+
+**Fix (v2).**
+
+- **Stage 2 uses only composition-invariant inputs:** pairwise string/number similarities, retrieval scores and within-S1 ranks, plus **country-relative IDF-weighted similarities**. The added similarities are weighted Jaccard, coverage, soft-TF-IDF with Jaro-Winkler ≥ 0.88, and the weight of the most distinctive unmatched token. The IDF is computed from each country's own unlabeled records and normalized by log N, so common words in any language are down-weighted automatically.
+  - Out-of-fold dev cost of the invariant set: −0.0050.
+  - The IDF similarities recover +0.0017 of it (CI [+0.0017, +0.0018]).
+- **Stage 3 re-introduces competition only through probabilities** (the best probability of another S1 for the same record, and sibling support). With stacking, v2 reaches **dev 0.9833 vs 0.9830 for v1** (paired bootstrap +0.0003, CI [+0.0002, +0.0004]). There is no in-distribution cost.
+- **Behaviour on test.** v2 is more conservative *by itself*, with the decision rule unchanged (expF + gate 0.6): 5.80M matches vs 6.00M for v1. It scored **0.974** on the public leaderboard.
+
+**Holdout note.** The holdout fold was scored once for v1 (0.9840) and a second time for the final v2 (0.9841). No v2 design decision used it. The v2 decisions came from dev folds and label-free test diagnostics, plus two coarse leaderboard direction checks (strict-threshold probe, final v2).
+
+## 5.6 Audit follow-up: final model v3 + threshold 0.9
+
+An external generalization audit made three main points: dev/holdout validation was blind to the leaderboard gap; composition dependence might remain in v2; and a shift-simulation suite should gate further changes. We implemented the items consistent with our guidelines.
+
+**Diagnostics** (no retraining, no holdout labels):
+
+- **Record IDs carry no signal.** The Spearman correlation between an S1's ID and its matches' IDs is −0.001, the same as random pairs.
+- **In-distribution calibration is excellent.** ECE is 0.0002 overall and at most 0.002 by stratum. S1s with names shared by ≥10 others are slightly over-confident in the mid-range (0.359 predicted vs 0.329 actual).
+- **Domain classifier on the full v2 model** (train vs test, including stage-3 features):
+
+  | Feature set | Domain AUC, US | Domain AUC, India |
+  |---|---|---|
+  | all 97 features | 0.946 | 0.937 |
+  | − `idf_n_miss_maxw`, `idf_a_miss_maxw` | **0.774** | **0.727** |
+  | − all 10 IDF features | 0.767 | 0.725 |
+  | − stage-3 density aggregates | 0.945 | 0.936 |
+  | − within-S1 ranks as well | 0.939 | 0.932 |
+
+  About 80% of the separability came from the two "maximum unmatched-token weight" features. Normalized IDF maps rare-token document frequencies to discrete levels that depend slightly on dataset size (0.957 in train vs 0.955 in test for a token seen once), so trees split between levels that move. Partial dependence also showed one of them *raising* match probability, which is counter-intuitive. Stage-3 aggregates and within-S1 ranks contributed ≤ 0.01 AUC and were kept.
+
+**v3 = v2 without the two features.**
+
+- Dev (stage 3): 0.9828 vs 0.9833 for v2, a −0.0005 cost at the audit's acceptance bar.
+- Public leaderboard: 0.974, the same as v2.
+- On test, v3 changes France most: 3.30 vs 3.17 matches per S1.
+
+**E1 shift suite** (`sim_shift.py`, `sim_eval.py`).
+
+- *The recipe was measured from training data only.* Real unowned near-copy records differ from the S1 they resemble as follows:
+
+  | Difference from the S1 | Unowned near-copy | True match |
+  |---|---|---|
+  | house number differs | 90% | 15% |
+  | name has an extra token | 47% | 13% |
+  | fully identical | 0.9% | 18% |
+
+  Train has 0.62 unowned near-copies per S1; test has about +0.6 more (label-free estimate).
+- *Construction.* We injected Poisson(0.6) perturbed copies of each fold-4 S1's own true records: house number offset in 90% of copies, and an extra token (sampled from real distractor tokens) in 47%. All parameters were fixed before scoring. We then re-ran blocking, stage 1 and features, and scored models trained on folds 1–3.
+- *Validity.* Uncertain candidates per S1 rose from 0.21 to 0.38, against test's 0.34–0.44.
+
+| Variant | Clean fold 4 | Injected fold 4 | Leaderboard |
+|---|---|---|---|
+| v1 expF | 0.9831 | 0.9224 | 0.960 |
+| v1 thr 0.9 | 0.9808 | 0.9311 | 0.967 |
+| v2 expF | 0.9833 | 0.9239 | 0.974 |
+| v2 thr 0.9 | 0.9815 | 0.9329 | – |
+| v3 expF | 0.9828 | 0.9241 | 0.974 |
+| v3 thr 0.9 | 0.9808 | 0.9329 | **0.975** |
+
+- **What the suite reproduces:** the near-copy mechanism (a stricter threshold helps under distractors, and v1 < v1@0.9).
+- **What it does not reproduce:** v2 > v1@0.9. The suite does not change dataset composition or include France, so it cannot judge composition-level fixes. Under our pre-registered rule it was therefore not used to choose between v2 and v3.
+
+**Final decision.**
+
+- v3 was adopted because it matched v2 on the leaderboard (a pre-declared confirmation submission) with much lower train-test shift.
+- The 0.9 acceptance threshold was adopted because three independent signals agree: the shift suite (+0.009 for every model), the earlier v1 probe (+0.007) and the confirmation submission (+0.001 for v3).
+- *Caveats.* The +0.001 on the public leaderboard alone is within noise. The threshold is density-specific: it costs about 0.002 on training-like data (holdout 0.9810 vs 0.9828 with expected-F), a deliberate trade-off.
+- *Leaderboard use, in total:* five submissions — v1, the v1 strict probe, v2, and the v3 / v3@0.9 pair. No threshold sweep was run against the leaderboard.
+
+**Audit items not implemented:**
+
+- The per-fold transliteration dictionary. This is a correct, small dev-only bias, and fixing it would mean rebuilding all features four times. The holdout is unaffected.
+- Relative `max_df` blocking and pseudo-label hardening. Both need a full rebuild, with uncertain payoff here.
+- All leaderboard-fitting (Tier 3) ideas.
+
+**Holdout use.** Fold 0 has now been scored three times: v1, v2, and the final v3@0.9 (0.9810). It never drove a decision.
+
+## 5.7 Second audit: claims verified against the implementation
+
+A second documentation-only audit made several claims. Each was checked against the code and, where cheap, measured (`audit2.py`, `p1_shift.py`). Dev folds and unlabeled test only; the holdout was not used.
+
+**Claims checked in the code:**
+
+| Claim | Finding |
+|---|---|
+| Hashing may depend on Python `hash()` | Not the case: `pd.util.hash_array` uses a fixed-key SipHash, so hashing is deterministic across processes. |
+| The gate should be removed from the final path | Already absent: the final rule is a plain 0.9 threshold plus exclusivity. |
+| House-number "conflict" and "missing" are indistinguishable | Partly: per-side number counts let trees separate them. |
+| "12 bis" collides with "12" | No such rule; "bis" stays as a token. |
+| Stage 3 on test uses stage-2 probabilities from the full-data model, not out-of-fold ones | True. This is a small train/test mismatch and was left unchanged. |
+| (second mismatch) France's stage-2 probabilities are pseudo-label-adapted, but stage 3 was trained on unadapted out-of-fold probabilities | True. A second train/test mismatch, limited to France. Noted, not fixed. |
+| Pseudo-label thresholds (0.97 / 0.03) might have been selected on results | They were fixed before any simulation. Adaptation is a single pass on stage 2 only. |
+
+**Measured results:**
+
+- **X1: is the shift suite's dose too high?** Label-free distractor share among near-copies, from the house-number and extra-token signatures:
+  - *Method validated on train:* estimates of 0.204 and 0.193 vs 0.193 actual.
+  - *Test:* 0.314 / 0.345, i.e. about 1.18 distractors per S1 vs 0.65 in train.
+  - *So the extra is about 0.52 per S1.* The suite's dose of 0.6 was about right, and **the claim that 0.9 is far too conservative is not supported.** However, two things remain unexplained: the suite's severity (a clean-to-injected drop of about 0.06, vs a 0.01–0.024 leaderboard gap) and its model-independent threshold gain (+0.009 for v1, v2 and v3 alike). X2 (stage 2 alone vs stage 2 + 3 on the injected fold) would test whether stage-3 sibling support on injected copies explains them.
+  - *By country:* US π = 0.33 / 0.23 and India 0.33 / 0.46, while **France π = 0.19 / 0.26, close to train**. The extra distractors are concentrated in US and India.
+  - *Caveat:* the two estimators disagree per country **in opposite directions** (house-number higher for US, extra-token higher for India). Their pooled agreement (0.31 vs 0.35) hides this. It stays within the proposed 0.15 tolerance, but the signatures transfer less cleanly per country than overall.
+  - *France:* being the least-shifted country fits the idea that 0.9 is slightly too strict there. Under the no-leaderboard-tuning rule it is left unchanged.
+- **P1: stratified label-shift correction.** Tested on the suite with every setting fixed in advance (see `p1_shift.py`):
+
+  | Fold 4 | raw expF | raw thr 0.9 | P1 + expF | P1 + thr 0.9 |
+  |---|---|---|---|---|
+  | clean | 0.9828 | 0.9808 | 0.9828 | 0.9807 |
+  | injected | 0.9241 | 0.9329 | 0.9258 | 0.9342 |
+
+  - *Detection works:* it finds no shift on clean data and raises the π estimate from 0.20 to 0.25 on injected data.
+  - *Effect:* it can't fix confident errors (distractor false merges mostly have P > 0.99), so it does not replace the threshold.
+  - *Not adopted:* +0.0013 on top of 0.9 is too small to justify without more evidence.
+- **X8: error decomposition of the final system (dev).**
+  - Threshold 0.9 halves false merges (9,860 vs 20,986).
+  - The largest remaining solvable loss is rejected true pairs *with* an address: oracle +0.0082, vs +0.0042 under expF.
+  - Future gains therefore need better discrimination on altered-house-number true matches, not decision-rule changes.
+- **X6: empty-set calibration.** Π(1−P) is calibrated overall (0.0564 predicted vs 0.0571 actual). It under-predicts emptiness in the middle bins (e.g. 0.11 vs 0.16), which affects about 1% of S1s, and the final threshold path doesn't use it.
+- **X7: coherence.** Only 1.9% of multi-claimant records have ΣP > 1, and only 0.01% of accepted pairs have a rival claimant with P > 0.5. **Coupled or Hungarian assignment would gain nothing**, which confirms the audit's own expectation.
+
+**Future work, prioritised.** Run X2 first. If stage-3 sibling support is confirmed to amplify injected near-copies, duplicate-discounted sibling support (P2) becomes the targeted fix for the largest remaining error class, rather than a speculative idea.
+
+**Decision.** The final submission (v3 + threshold 0.9) is unchanged. The audit's remaining proposals (duplicate-discounted siblings, three-state field encoding, fold-averaged test-time stage 2, pseudo-label hardening) each need a retrain plus leaderboard confirmation, and have small expected gains. Under our no-leaderboard-tuning rule they are recorded as future work.
+
+---
+
+## 6. Conclusion
+
+Careful blocking (name×locality conjunctions, transliteration-aware normalisation) and a learned ranker give a 0.981 recall ceiling at 25 candidates per entity. Pairwise gradient boosting, set-level stacking and an exclusivity-aware expected-F0.5 decision layer reach 0.984 on the holdout.
+
+The largest real-world gain came from **generalisation**. We diagnosed, label-free, that composition-dependent features did not transfer to the test set. Replacing them with invariant and country-relative ones raised the public leaderboard from 0.960 to **0.974**, at no cost in-distribution. An audit-driven follow-up removed a further scale-shifted feature pair (v3) and adopted a distractor-robust acceptance threshold, supported by a measured near-copy shift simulation: final **0.975**.
+
+The main lesson: features describing *the dataset* rather than *the pair* are a hidden overfitting risk in entity resolution. A train-vs-test domain classifier is a cheap way to find them.
+
+---
+
+## Appendix
+
+### A. Code Artefacts
+
+`code/business_entity_resolution/` (see its README for exact commands):
+
+```
+src/
+  main.py            end-to-end orchestration: prep → cands → validate → holdout → fit → infer
+  prep.py            folds, transliteration dictionary (train folds only), normalization → parquet
+  normalization.py   Indic transliteration, acronym decoding, name/address representations
+  translit_dict.py   learned transliteration dictionary
+  data_loader.py     TSV loading (sep="\t", QUOTE_NONE), parallel normalization
+  eda.py             EDA + ground-truth analysis
+  blocking.py        hashed TF-IDF retrieval channels (country-blocked)
+  candidates.py      candidate generation, labelling, recall report
+  ranker1.py         stage-1 candidate ranker (top-25)
+  features.py        pair, context and ambiguity features
+  train.py           stage-2/3 OOF training, policies, subset reports, experiment log
+  stack.py           stage-3 set-level (graph) features
+  decision.py        exclusivity, thresholds, expected-F0.5 + singleton gate
+  adapt.py           unseen-country pseudo-label adaptation (+ LOCO simulation)
+  final.py           holdout scoring (v1 and v2), v1 fit/inference
+  final2.py          final v2: composition-invariant stage 2 + stage-3 stacking, fit, test inference
+  features_idf.py    country-relative IDF-weighted similarities
+  exp.py             generalisation experiments (invariant feature sets, LOCO, simulations)
+  diag_*.py, probe.py, prior_shift.py, dense.py   label-free shift diagnostics and negative-result experiments
+  evaluation.py      exact macro F0.5 + diagnostics, paired bootstrap
+  error_analysis.py  error taxonomy; analyze_loss.py oracle loss decomposition; policy_sweep.py
+  submission.py      TSV writer + self-check
+```
+
+Reproduce: `cd src && ER_ROOT=<student_resource> python main.py all`. This writes `output/matching_results.tsv` and `output/candidate_pairs.tsv` and runs `utils/validate_submission.py`.
+
+### B. Additional Results
+
+- **Computational cost.** Measured on AWS r7i.2xlarge (8 vCPU, 64 GB RAM, plus 32 GB swap):
+  - normalisation: about 5 min per split
+  - train candidate generation (2.2M × 10.3M): 30 min
+  - stage 1: 40 min
+  - stage-2 features (55M pairs): 15 min
+  - 4-fold OOF: 35 min
+  - stacking features: 8 min
+- **Reproducibility:** fixed seeds (42), deterministic md5 folds, pinned requirements, and all intermediate artefacts cached under `work/`.
+- **License compliance:** numpy, pandas, scipy (BSD); pyarrow (Apache-2.0); lightgbm (MIT); rapidfuzz (MIT); sparse_dot_topn (Apache-2.0). The only models are LightGBM models trained from scratch; there are no pretrained weights or LLMs.
+- **No-external-data compliance:** the code makes no network calls, uses no geocoding, registries or lookups, and uses no external data. It uses only the challenge TSVs. Linguistic normalisation tables (abbreviations, legal forms, letter names, the Indic script layout) are generic rules written in code. The transliteration dictionary is learned from training pairs only.
