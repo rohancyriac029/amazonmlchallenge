@@ -125,7 +125,11 @@ def infer_cmd(a):
         features_num.build("test", "test_feat")
     X, meta, cols2 = matrix("test_feat", spec)
     assert cols2 == sp["cols2"]
-    p2 = lgb.Booster(model_file=config.work(f"stage2_{a.tag}.txt")).predict(X, num_threads=config.N_JOBS)
+    if a.s2_avg:   # R5: mean of the 4 dev-fold stage-2 models, matching the OOF inputs stage 3 was trained on
+        p2 = np.mean([lgb.Booster(model_file=config.work(f"s2fold_{a.s2_avg}_{f}.txt")).predict(X, num_threads=config.N_JOBS)
+                      for f in (1, 2, 3, 4)], axis=0)
+    else:
+        p2 = lgb.Booster(model_file=config.work(f"stage2_{a.tag}.txt")).predict(X, num_threads=config.N_JOBS)
     df = pd.read_parquet(config.work("test_v1.parquet"), columns=["entity_id", "src", "country", "n_core",
                                                                    "a_norm", "a_first_num"])
     if a.adapt:
@@ -152,9 +156,14 @@ def infer_cmd(a):
     meta["prob"] = lgb.Booster(model_file=config.work(f"stage3_{a.tag}.txt")).predict(X, num_threads=config.N_JOBS)
     np.save(config.work(f"test_prob_{a.tag}.npy"), meta.prob.values)
     s1_ids = df.entity_id.values[(df.src == 1).values]
-    preds = decision.to_sets(df, train.default_policies()[a.policy](meta), s1_ids)
+    if a.policy == "cond_num":   # R1
+        meta["num_agree"] = (pd.read_parquet(config.work("test_feat_N.parquet"), columns=["num_state"]).num_state.values == 1)
+        sel = decision.conditional_policy(meta)
+    else:
+        sel = train.default_policies()[a.policy](meta)
+    preds = decision.to_sets(df, sel, s1_ids)
     cands = decision.to_sets(df, meta, s1_ids)
-    out = config.OUT_DIR if a.final else os.path.join(config.OUT_DIR, a.tag)
+    out = config.OUT_DIR if a.final else os.path.join(config.OUT_DIR, a.out or a.tag)
     mp_, cp_ = os.path.join(out, "matching_results.tsv"), os.path.join(out, "candidate_pairs.tsv")
     write_sets(mp_, s1_ids, preds, "matched_entity_ids")
     write_sets(cp_, s1_ids, cands, "candidate_entity_ids")
@@ -176,5 +185,7 @@ if __name__ == "__main__":
     ap.add_argument("--policy", default="expF_gate0.6")
     ap.add_argument("--adapt", action="store_true")
     ap.add_argument("--final", action="store_true", help="write to output/ instead of output/<tag>/")
+    ap.add_argument("--s2-avg", default="", help="exp tag whose saved fold models are averaged for test-time stage 2 (R5)")
+    ap.add_argument("--out", default="", help="output sub-folder name (default: tag)")
     a = ap.parse_args()
     {"stack": stack_cmd, "fit": fit_cmd, "infer": infer_cmd}[a.stage](a)

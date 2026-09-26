@@ -102,6 +102,7 @@ def main():
     ap.add_argument("--loco", default="")
     ap.add_argument("--compare", default="")
     ap.add_argument("--balance", action="store_true", help="country-balanced sample weights")
+    ap.add_argument("--save-models", action="store_true", help="save the fold models (R5: fold-averaged test-time stage 2)")
     a = ap.parse_args()
     t0 = time.time()
     gt = read_ground_truth()
@@ -145,6 +146,8 @@ def main():
     else:
         for f in train.DEV_FOLDS:
             mdl = train_on(lambda m, f=f: (m.fold.values != f) & (m.fold.values != 0), f)
+            if a.save_models:
+                mdl.save_model(config.work(f"s2fold_{a.tag}_{f}.txt"))
             for k, (X, m, _) in data.items():
                 te = np.flatnonzero(m.fold.values == f)
                 prob[k][te] = mdl.predict(X[te], num_threads=config.N_JOBS)

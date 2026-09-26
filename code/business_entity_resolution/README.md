@@ -80,6 +80,10 @@ The final configuration is **v3 + house-number relation features with an accepta
 | `roadmap_diag.py` | blocking-miss taxonomy, FN/FP taxonomy of the final system, house-number difference statistics |
 | `e_compare.py` | paired comparison of two stage-3 runs (bootstrap + per-class FN/FP), seed-variance summary |
 | `domain_n.py` | train-vs-test domain AUC with and without the house-number features |
+| `roadmap_diag2.py` | residual FN/FP taxonomy of the final model (split of the former "other" class, house-number, name-only and DBA residuals) |
+| `r1_eval.py` | R1 evidence-conditional decision (`decision.conditional_policy`, `final2.py --policy cond_num`) and X2 stage-3-under-injection check (tested, not adopted) |
+| `r4_audit.py` | R4 samples of residual house-number FN/FP pairs (no new features justified) |
+| `r5_check.py` | R5 fold-averaged test-time stage 2 (`exp.py --save-models`, `final2.py --s2-avg`) vs full model, KS distance to dev OOF (tested, not adopted) |
 | `bench_block.py`, `bench_miss.py` | blocking recall benchmark and miss analysis |
 | `eda.py` | exploratory data analysis |
 

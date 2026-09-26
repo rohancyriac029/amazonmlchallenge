@@ -451,7 +451,29 @@ No dataset statistics are involved. Final stage 2 has 85 features and stage 3 ha
 
 The shift suite was not used to judge E1. Its injection recipe (±1–12 house-number offsets) mirrors the new features, so a suite gain would be partly circular.
 
-**Roadmap items not run** (future work): taxonomy of the "other" error class, locality-contradiction features, the stage-3 amplification test with duplicate-discounted siblings, fold-averaged test-time stage 2, corroborated name-only acceptance, the DBA evidence gate, measuring blocking recovery, and swapping stage-3 density features.
+The "other" taxonomy, stage-3 amplification and fold-averaged test-time stage 2 were tested in §5.9. **Roadmap items still not run** (future work): locality-contradiction features, corroborated name-only acceptance and the DBA evidence gate (the §5.9 diagnostics make both unpromising), and measuring blocking recovery.
+
+## 5.9 Final roadmap round: tested, none adopted
+
+**Refreshed diagnostics of the final model** (dev, `roadmap_diag2.py`):
+
+- *Oracle gains.* Rejected true pairs with an address: +0.0064. Name-only: +0.0041. Unowned false merges: +0.0012.
+- *FN mix* (155,096): 49% name-only, 20% same name with a different house number, 13% DBA.
+- *FP mix* (9,100): 27% house number differs, 24% near-identical copies with agreeing numbers.
+- *Name-only FNs are mostly irreducible.* Only 12% have a unique S1 name (vs 63% of name-only FPs). Exact-name sibling support is present for 91% of FNs and 90% of FPs, so it does not separate them.
+- *DBA.* Exact-address evidence is *more* frequent among FPs (64%) than FNs (51%).
+
+Each experiment's acceptance rule was fixed before it ran. **The leaderboard was used only as a veto, and was not needed**: no candidate change passed. R3 is a robustness check of the features already in use, and it passed:
+
+| Experiment | Hypothesis | Result | Decision |
+|---|---|---|---|
+| R1: strict threshold only where house numbers conflict/unknown, calibrated expected-F where they agree | Test's extra distractors change the house number, so pairs with agreeing numbers don't need the strict threshold | Dev +0.00053 [+0.00049, +0.00057]; suite tie (0.93674 vs 0.93654). **Pre-registered precondition failed:** the label-free distractor share among number-agreeing near-copies is 0.044 on test vs 0.029 on train (the signature is exact on train), driven by India (0.12). R1's dev gain also came with more FPs in exactly that class. | **Rejected.** A US/France-only variant would be post-hoc and was not pursued. |
+| R2 / X2: stage-3 sibling support amplifies near-copies | The stacking gain should shrink under injected distractors | Stacking gain at thr 0.9: clean +0.0132, injected **+0.0156** | **Refuted.** Dedup-sibling variant (and the density-feature swap) dropped. |
+| R4: residual house-number audit | A secondary-number pattern could separate the remaining 31k FNs | Remaining FNs with \|Δ\| ≤ 12 are true matches with genuinely nearby numbers, indistinguishable from neighbouring-premises distractors; secondary numbers are already covered by `a_njacc`/`a_ncontain` | **No new features** (no pattern ≥ 30%) |
+| R5: fold-averaged test-time stage 2 | Matching stage 3's OOF training inputs should reduce the train/test mismatch | Determinism check passed (re-run OOF identical to 6×10⁻⁸). KS to dev-OOF probabilities: full-data model 0.0519, **fold average 0.0668 (further away)** | **Rejected**; the full-data model stays |
+| R3: leave-one-country-out check of the house-number features | The features should transfer to an unseen country (pre-declared: the gain must hold in both directions) | Stage 2, trained on one country and scored on the other, with vs without the 9 features. US → India: 0.9266 → **0.9323**, +0.0057 [+0.0054, +0.0059]; missed 282,611 → 251,547, false merges 83,466 → 82,691. India → US: 0.9555 → **0.9627**, +0.0073 [+0.0071, +0.0074]; false merges 82,676 → 64,361, missed 249,785 → 237,260. (The thr 0.7 policy gives +0.0062 / +0.0068.) | **Passed in both directions.** The features encode a pair relation, not a country-specific pattern, so they stay. The cross-country gain is larger than in-distribution because the weaker cross-country baseline leans more on the number relation. |
+
+The final submission is unchanged (**public leaderboard 0.977**).
 
 ---
 

@@ -70,3 +70,15 @@ def gated_expected_f_policy(pairs, gate=0.6, prob_col="prob", **kw):
     sel = expected_f_policy(pairs, prob_col=prob_col, **kw)
     mx = pairs.groupby("q")[prob_col].max()
     return sel[sel.q.map(mx).values >= gate]
+
+
+def conditional_policy(pairs, t=0.9, agree_col="num_agree", prob_col="prob"):
+    """R1: strict threshold where house numbers conflict or are unknown (the stratum in which
+    test's extra near-copy distractors live: 90% of distractors change the house number);
+    the calibrated expected-F rule (gate 0.6) where the house numbers agree."""
+    strict = pairs[pairs[prob_col] >= t]
+    ef = gated_expected_f_policy(pairs, gate=0.6, miss_mass=0.3, prob_col=prob_col)
+    ef = ef[ef[agree_col].values == 1]
+    sel = pd.concat([strict, ef])
+    sel = sel[~sel.index.duplicated()]
+    return exclusive(sel, prob_col)

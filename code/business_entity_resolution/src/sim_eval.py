@@ -29,6 +29,7 @@ VARIANTS = {
     "v1": ("base", "oof_stack1.npy"),
     "v2": ("inv2", "oof_s3inv2.npy"),
     "v3": ("inv3", "oof_s3inv3.npy"),
+    "v3n": ("inv3n", "oof_s3inv3n.npy"),
 }
 
 
@@ -71,6 +72,7 @@ def main(names):
         # --- injected table
         X, ms, _ = exp.load("train_sim_feat", spec["base_cols"], spec["extra"])
         p2 = M2.predict(X, num_threads=config.N_JOBS).astype(np.float32)
+        np.save(config.work(f"sim_p2_{name}.npy"), p2)
         Ssim = stack.stack_features(df_sim, ms, p2)
         X = np.hstack([X, Ssim.values.astype(np.float32)])
         ms = ms.copy(); ms["prob"] = M3.predict(X, num_threads=config.N_JOBS)
