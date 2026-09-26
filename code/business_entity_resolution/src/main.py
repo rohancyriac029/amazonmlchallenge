@@ -1,4 +1,4 @@
-"""End-to-end pipeline (final = shift-robust v3 + threshold 0.9): data -> normalization -> blocking -> matching -> output.
+"""End-to-end pipeline (final = shift-robust v3 + house-number relation features, threshold 0.9): data -> normalization -> blocking -> matching -> output.
 
   python main.py all        # everything below, in order
   python main.py prep       # folds, transliteration dictionary (dev folds only), normalization
@@ -13,7 +13,7 @@ import subprocess
 import sys
 
 POLICY = "thr0.9"   # robust to near-copy distractor density (E1 shift suite + leaderboard confirmation)
-S2, TAG = "inv3", "s3inv3"
+S2, TAG = "inv3n", "s3inv3n"
 
 
 def sh(*args):
@@ -30,11 +30,13 @@ def main(stage):
     if stage in ("features", "all"):
         sh("train.py", "--tag", "base")                    # builds train features + stage-1 model; logs the v1 baseline
         sh("features_idf.py", "train", "train_feat")
+        sh("features_num.py", "train", "train_feat")          # house-number relation features (E1)
     if stage in ("validate", "all"):
         # composition-invariant stage 2: drop raw ambiguity counts, raw competition gaps/ranks and stage-1 score;
         # add country-relative IDF similarities except the two scale-shifted max-unmatched-token weights (A8)
+        # plus house-number relation features (N)
         sh("exp.py", "--tag", S2, "--train", "normal", "--evals", "normal",
-           "--invariant", "size+comp+s1", "--extra", "A8")
+           "--invariant", "size+comp+s1", "--extra", "A8N")
         sh("final2.py", "stack", "--s2", S2, "--tag", TAG)
     if stage in ("holdout", "all"):
         sh("final.py", "holdout", "--tag", TAG, "--policy", POLICY)

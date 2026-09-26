@@ -27,13 +27,15 @@ The final model (**v2**) is additionally made **robust to dataset shift**. A tra
 
 Results:
 
-| | v1 | v2 | **v3 + threshold 0.9 (final)** |
-|---|---|---|---|
-| Public leaderboard (macro F0.5) | 0.960 | 0.974 | **0.975** |
-| Holdout fold (training distribution) | 0.9840 | 0.9841 | 0.9810 |
-| Dev 4-fold OOF | 0.9830 ± 0.0001 | 0.9833 ± 0.0001 | 0.9808 (fold 4 only)* |
+| | v1 | v2 | v3 @ thr 0.9 | **v3 + house-number features @ thr 0.9 (final)** |
+|---|---|---|---|---|
+| Public leaderboard (macro F0.5) | 0.960 | 0.974 | 0.975 | **0.977** |
+| Holdout fold (training distribution) | 0.9840 | 0.9841 | 0.9810 | **0.9829** |
+| Dev 4-fold OOF | 0.9830 ± 0.0001 | 0.9833 ± 0.0001 | 0.9805\* | **0.9824**\* |
 
-\* v3's expected-F rule scores 0.9828 on the full 4-fold dev. The thr-0.9 figure is dev fold 4 (the E1 clean set). The 0.9 threshold deliberately trades in-distribution recall for robustness to near-copy distractors (§5.6). v3 with the v2 rule also scored 0.974 on the leaderboard.
+\* Under the 0.9 threshold. With the expected-F rule, the same models score 0.9828 (v3) and **0.9842** (final) on dev. The threshold deliberately trades in-distribution recall for robustness to near-copy distractors (§5.6). Seed noise on dev is ±0.00007 (3 seeds, §5.8).
+
+The last step (§5.8) added **house-number relation features**. The model can now tell *neighbouring premises* (a distractor a few doors away, typically on the other side of the street) from a *corrupted house number* (a typo or truncation on a true match). That cut house-number misses by 34% and the related false merges by 22%.
 
 ---
 
@@ -127,7 +129,7 @@ Noise patterns observed:
 
 **Features used** (v1 stage 2: 89 features; `features.py`).
 
-> **Final model (v2):** stage 2 uses 78 features. That is this list *minus* the raw ambiguity counts, the raw competition gaps/ranks and the stage-1 score/rank, *plus* 10 country-relative IDF-weighted similarities. Stage 3 adds 19 stacking features (97 in total). See §5.5 for why.
+> **Final model:** stage 2 uses 85 features. That is this list *minus* the raw ambiguity counts, the raw competition gaps/ranks and the stage-1 score/rank, *plus* 8 country-relative IDF-weighted similarities (v2 had 10; v3 dropped two scale-shifted ones, §5.6) and 9 house-number relation features (§5.8). Stage 3 adds 19 stacking features (104 in total). See §5.5–5.8 for why.
 
 - **Name features:**
   - RapidFuzz ratio, token-sort and token-set on the core form
@@ -222,10 +224,15 @@ The pseudo-labels on the unseen country were clean: positives at 0.990 precision
   - France adaptation: 750,103 pseudo-positives and 5,293,882 pseudo-negatives.
   - Validator **PASS** with `--check-ids`.
   - Public leaderboard **0.974**.
-- **Test set, final (v3 + threshold 0.9):**
+- **Test set, v3 + threshold 0.9:**
   - 5,743,719 matches. Matches per S1: US 3.36, India 3.31, France 3.22. Predicted-empty rate: 6.0%, 6.2% and 6.1% respectively.
   - Validator **PASS** with `--check-ids`.
   - Public leaderboard **0.975**.
+- **Test set, final (v3 + house-number features, threshold 0.9):**
+  - 5,765,771 matches. Matches per S1: US 3.36, India 3.32, France 3.29. Predicted-empty rate: 6.0%, 6.2% and 6.0% respectively.
+  - France adaptation: 758,147 pseudo-positives and 5,303,057 pseudo-negatives.
+  - Validator **PASS** with `--check-ids`.
+  - Public leaderboard **0.977**.
 
 ### 5.4 Error analysis (dev folds)
 
@@ -400,13 +407,59 @@ A second documentation-only audit made several claims. Each was checked against 
 
 **Decision.** The final submission (v3 + threshold 0.9) is unchanged. The audit's remaining proposals (duplicate-discounted siblings, three-state field encoding, fold-averaged test-time stage 2, pseudo-label hardening) each need a retrain plus leaderboard confirmation, and have small expected gains. Under our no-leaderboard-tuning rule they are recorded as future work.
 
+## 5.8 Roadmap follow-up: house-number relation features (final model)
+
+**Diagnostics on the v3 @ 0.9 system** (`roadmap_diag.py`, dev folds only):
+
+- *Where the loss sits.* Oracle gains are +0.0082 for rejected true pairs *with* an address, +0.0042 without an address, and +0.0014 for false merges onto unowned records. Of 116k lost true pairs, 114.6k were never retrieved and only 1.3k were pruned by stage 1.
+- *False negatives* (172.8k): 44% no address, **27% same name with a different house number**, 12% DBA/renamed. 45% sit at P 0.5–0.9 and 55% below 0.5.
+- *False positives* (9.9k): the largest named class is same name with a different house number (3.1k).
+- *Blocking misses:* 59.6% have no address on the other side, 25.4% share no name token, about 7% are Indic-script.
+- *How house numbers differ* (strong near-duplicates whose number differs):
+
+  | | True match (795k) | Unowned distractor (1.18M) |
+  |---|---|---|
+  | Median \|Δ\| | 301 | **7** |
+  | \|Δ\| ≤ 12 | 15% | **69%** |
+  | Same parity | 57% | **25%** |
+  | Truncation / prefix | **18%** | 3% |
+  | S1's number appears elsewhere in the record | **48%** | 6% |
+
+  Distractors are neighbouring premises; true matches differ by corruption. The only numeric similarity the model had (character-based Indel) rates 30→32 as *less* similar than 1325→6325, so it could not express this.
+
+**E1: house-number relation features** (`features_num.py`, 9 features). All are pair-relational and three-state (agree / conflict / unknown when a side lacks a number):
+
+- log(1+|Δ|) of the first numbers
+- same parity; same length
+- one-digit substitution; digit transposition; prefix / truncation
+- "neighbour": the numbers differ, |Δ| ≤ 12 and the street words overlap by ≥ 50%
+- log of the smallest |Δ| between the S1's number and *any* number in the other record
+
+No dataset statistics are involved. Final stage 2 has 85 features and stage 3 has 104.
+
+**Acceptance checks** (pre-declared in the audit):
+
+| Check | Result |
+|---|---|
+| Dev, thr 0.9 | 0.98054 → **0.98239**, +0.00184 [95% CI +0.00176, +0.00192] |
+| Dev, expected-F | 0.98277 → 0.98420, +0.00143 [+0.00136, +0.00150] |
+| E9 seed noise (v3, seeds 42 / 7 / 13) | std 0.00007 (thr 0.9), 0.00002 (expF). The E1 gain is about 26× the seed std. |
+| Targeted class | house-number FN 47,098 → 30,966 (−34%), FP 3,103 → 2,425 (−22%). No other class worsened beyond noise (e.g. DBA FN 20,014 → 19,555, Indic FN 4,563 → 4,184). |
+| Train-vs-test shift | domain AUC of stage 2: US 0.6868 → 0.6872, India 0.6389 → 0.6385. The new features alone reach 0.53 / 0.52, near chance. |
+| Holdout (fourth scoring; no decision used it) | 0.9810 → **0.9829**, consistent with the dev gain |
+| Leaderboard (one pre-declared confirmation) | 0.975 → **0.977** |
+
+The shift suite was not used to judge E1. Its injection recipe (±1–12 house-number offsets) mirrors the new features, so a suite gain would be partly circular.
+
+**Roadmap items not run** (future work): taxonomy of the "other" error class, locality-contradiction features, the stage-3 amplification test with duplicate-discounted siblings, fold-averaged test-time stage 2, corroborated name-only acceptance, the DBA evidence gate, measuring blocking recovery, and swapping stage-3 density features.
+
 ---
 
 ## 6. Conclusion
 
 Careful blocking (name×locality conjunctions, transliteration-aware normalisation) and a learned ranker give a 0.981 recall ceiling at 25 candidates per entity. Pairwise gradient boosting, set-level stacking and an exclusivity-aware expected-F0.5 decision layer reach 0.984 on the holdout.
 
-The largest real-world gain came from **generalisation**. We diagnosed, label-free, that composition-dependent features did not transfer to the test set. Replacing them with invariant and country-relative ones raised the public leaderboard from 0.960 to **0.974**, at no cost in-distribution. An audit-driven follow-up removed a further scale-shifted feature pair (v3) and adopted a distractor-robust acceptance threshold, supported by a measured near-copy shift simulation: final **0.975**.
+The largest real-world gain came from **generalisation**. We diagnosed, label-free, that composition-dependent features did not transfer to the test set. Replacing them with invariant and country-relative ones raised the public leaderboard from 0.960 to **0.974**, at no cost in-distribution. An audit-driven follow-up removed a further scale-shifted feature pair (v3) and adopted a distractor-robust acceptance threshold, supported by a measured near-copy shift simulation (0.975). A final evidence-driven step added pair-relational house-number features, which separate neighbouring premises from corrupted numbers, for a final **0.977**.
 
 The main lesson: features describing *the dataset* rather than *the pair* are a hidden overfitting risk in entity resolution. A train-vs-test domain classifier is a cheap way to find them.
 

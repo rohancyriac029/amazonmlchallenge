@@ -52,13 +52,13 @@ then runs the official validator, which must print `PASS`.
 |---|---|---|---|
 | prep | `python main.py prep` | S1 5-fold assignment (md5 of id); transliteration dictionary from dev-fold pairs only; normalization of all records → parquet | 10 min |
 | cands | `python main.py cands` | 5-channel hashed TF-IDF retrieval blocked by country (≈80 candidates per S1), train + test | 30 + 24 min |
-| features | `python main.py features` | stage-1 ranker (OOF) → top-25 per S1 → pair/context features; logs the v1 baseline; IDF-weighted similarities | ≈ 2 h |
-| validate | `python main.py validate` | **composition-invariant stage 2** (`exp.py --invariant size+comp+s1 --extra A8`) and **stage-3 stacking**, both 4-fold out-of-fold on dev folds | ≈ 1.3 h |
+| features | `python main.py features` | stage-1 ranker (OOF) → top-25 per S1 → pair/context features; logs the v1 baseline; IDF-weighted similarities; house-number relation features | ≈ 2 h |
+| validate | `python main.py validate` | **composition-invariant stage 2** (`exp.py --invariant size+comp+s1 --extra A8N`) and **stage-3 stacking**, both 4-fold out-of-fold on dev folds | ≈ 1.3 h |
 | holdout | `python main.py holdout` | score on the holdout fold 0 | 5 min |
 | fit | `python main.py fit` | stage-2 and stage-3 models on all training data | 30 min |
 | infer | `python main.py infer` | test: candidates/features if missing → stage 2 → pseudo-label adaptation for countries absent from training → stage 3 → decision policy → `output/*.tsv` → self-check + official validator | 30 min |
 
-The final configuration is **v3 with an acceptance threshold of 0.9** (tags `inv3` / `s3inv3`, policy `thr0.9`). v3 is v2 without two scale-shifted IDF features. The earlier v1 (`train.py --stack`, `final.py fit/infer`) and v2 (`inv2` / `s3inv2`) configurations are kept for the ablation record.
+The final configuration is **v3 + house-number relation features with an acceptance threshold of 0.9** (tags `inv3n` / `s3inv3n`, policy `thr0.9`; public leaderboard 0.977). v3 is v2 without two scale-shifted IDF features. The house-number features (`features_num.py`) separate neighbouring premises from corrupted house numbers. The earlier v1 (`train.py --stack`, `final.py fit/infer`) and v2 (`inv2` / `s3inv2`) configurations are kept for the ablation record.
 
 **Analysis and diagnostic tools** (development only):
 
@@ -77,6 +77,9 @@ The final configuration is **v3 with an acceptance threshold of 0.9** (tags `inv
 | `sim_shift.py`, `sim_eval.py` | E1 shift suite: measured near-copy perturbations injected into dev fold 4, frozen-variant scoring |
 | `audit2.py` | second-audit checks: label-free distractor share (X1), error decomposition (X8), empty-set calibration (X6), probability coherence (X7) |
 | `p1_shift.py` | stratified label-shift correction for near-copy candidates (tested, not adopted) |
+| `roadmap_diag.py` | blocking-miss taxonomy, FN/FP taxonomy of the final system, house-number difference statistics |
+| `e_compare.py` | paired comparison of two stage-3 runs (bootstrap + per-class FN/FP), seed-variance summary |
+| `domain_n.py` | train-vs-test domain AUC with and without the house-number features |
 | `bench_block.py`, `bench_miss.py` | blocking recall benchmark and miss analysis |
 | `eda.py` | exploratory data analysis |
 
@@ -116,6 +119,7 @@ src/
   final.py           holdout evaluation (both versions); v1 fit/inference
   final2.py          v2 (shift-robust) stage-3 OOF, final fit, test inference
   features_idf.py    country-relative IDF-weighted similarities (change A)
+  features_num.py    house-number relation features (final model)
   error_analysis.py, analyze_loss.py, policy_sweep.py, bench_block.py, bench_miss.py   analysis tools
   submission.py      writes the TSVs and self-checks them
   main.py            orchestrates the full pipeline

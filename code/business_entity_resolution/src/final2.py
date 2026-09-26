@@ -120,6 +120,9 @@ def infer_cmd(a):
     if spec["extra"] and not os.path.exists(config.work("test_feat_A.parquet")):
         import features_idf
         features_idf.build("test", "test_feat")
+    if spec["extra"] == "A8N" and not os.path.exists(config.work("test_feat_N.parquet")):
+        import features_num
+        features_num.build("test", "test_feat")
     X, meta, cols2 = matrix("test_feat", spec)
     assert cols2 == sp["cols2"]
     p2 = lgb.Booster(model_file=config.work(f"stage2_{a.tag}.txt")).predict(X, num_threads=config.N_JOBS)
