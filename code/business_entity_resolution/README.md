@@ -97,6 +97,7 @@ The final configuration is **v3 + house-number relation features + cross-encoder
 | `ce_loco.py` | unseen-country simulation (India held out, US-only stage 2 and cross-encoder) that validated the self-training of `ce_train.py adapt` |
 | `diag_residual.py` | residual loss of the final model: empty predictions by top-candidate probability, loss by S1 error kind |
 | `diag_france.py` | label-free confidence profile of France vs US/India on test, with uncertain French examples |
+| `ce_veto.py` | CE veto on accepted near-exact copies (p2 ≥ 0.999); failed its split-half dev gate, not adopted |
 | `ce_domain.py` | train-vs-test domain AUC with and without the CE logit, against reference pair features |
 | `ce_leak.py` | memorisation check: CE gain on records the scoring half-model saw in training vs never saw |
 | `bench_block.py`, `bench_miss.py` | blocking recall benchmark and miss analysis |

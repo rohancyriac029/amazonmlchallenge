@@ -556,6 +556,22 @@ The gain is **+0.0121 [95% CI +0.0119, +0.0123]**. It was unchanged (+0.0121) wi
 
 **Leaderboard:** 0.983 → **0.983**. With France at 15% of test, the expected overall gain (about +0.0005 to +0.002) is at or below the leaderboard's display resolution. Under the rule fixed before the submission (the leaderboard is a veto only, and the evidence is the pre-registered simulation), **it is adopted as the final model**. The pre-adaptation submission is kept as a separate snapshot (git tag `v0.983`).
 
+## 5.12 Last experiment: cross-encoder veto on near-exact copies (rejected on dev)
+
+**Hypothesis.** The CE never scored pairs with stage-2 probability ≥ 0.999, yet test carries about 0.5 extra near-exact *unowned* copies per S1 (§5.7). An accepted pair there that the CE strongly rejects could be such a distractor. This is `ce_veto.py`: score the accepted pairs with p2 ≥ 0.999, and drop those with CE logit < τ.
+
+**Gate, fixed before any result.** The change had to *gain* on dev; no leaderboard probing.
+
+- τ was chosen on one random half of a 25% dev S1 sample (441k S1).
+- It then had to gain ≥ +0.00014 on the other half, with a bootstrap CI above 0.
+
+**Result.** The blind spot holds only **59 false matches among 1.0M accepted dev pairs**. Every τ that removes any of them removes more true matches:
+
+- τ = −5: 12 false / 38 true, ΔF0.5 −0.000002
+- τ = 0: 21 false / 2,355 true, ΔF0.5 −0.000494
+
+No τ gains on dev, so **rejected, with no submission**. In-distribution, near-exact copies are almost always true matches. Whatever extra test distractors exist there cannot be separated from true matches by the CE with dev evidence.
+
 ---
 
 ## 6. Conclusion
