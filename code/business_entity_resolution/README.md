@@ -1,15 +1,21 @@
 # Business Entity Resolution: reproducible pipeline
 
-Blocking → stage-1 candidate ranker → stage-2 LightGBM pair matcher → precision-first
-set selection. Everything runs offline, uses only the challenge files, and needs no
-pretrained model. The only learned models are two LightGBM classifiers trained from
-scratch on the provided training data.
+Blocking → stage-1 candidate ranker → stage-2 LightGBM pair matcher → cross-encoder →
+stage-3 LightGBM stacker → precision-first set selection. It uses only the challenge files.
+The LightGBM models are trained from scratch. The cross-encoder is fine-tuned from
+`intfloat/multilingual-e5-small` (MIT licence, 118M parameters), which serves only as the
+initialisation; no external data, API or lookup is used.
 
 ## 1. Environment
 
 * Python 3.12, Linux x86_64. Development and the final run used AWS EC2 r7i.2xlarge
   (8 vCPU, 64 GB RAM) plus a 32 GB swap file. About 64 GB RAM is recommended, because
   the full training candidate set has 174M pairs.
+* The cross-encoder step (`python main.py ce`) needs a CUDA GPU with at least 6 GB, plus
+  `torch` and `transformers`. The final run did this step on a laptop RTX 4050 (6 GB):
+  about 28 min per half-model and about 45 min of scoring. It fetches
+  `intfloat/multilingual-e5-small` from the Hugging Face hub on first use; point
+  `ER_CE_MODEL` at a local copy to run offline.
 * Install the dependencies (all MIT, Apache-2.0 or BSD):
 
 ```bash
@@ -34,6 +40,7 @@ Environment variables:
 * `ER_WORK`: cache directory (default `$ER_ROOT/work`)
 * `ER_OUT`: output directory (default `$ER_ROOT/output`)
 * `ER_JOBS`: number of worker processes (default: CPU count)
+* `ER_CE_MODEL`: cross-encoder initialisation (default `intfloat/multilingual-e5-small`)
 
 ## 3. One-command reproduction
 
@@ -54,11 +61,12 @@ then runs the official validator, which must print `PASS`.
 | cands | `python main.py cands` | 5-channel hashed TF-IDF retrieval blocked by country (≈80 candidates per S1), train + test | 30 + 24 min |
 | features | `python main.py features` | stage-1 ranker (OOF) → top-25 per S1 → pair/context features; logs the v1 baseline; IDF-weighted similarities; house-number relation features | ≈ 2 h |
 | validate | `python main.py validate` | **composition-invariant stage 2** (`exp.py --invariant size+comp+s1 --extra A8N`) and **stage-3 stacking**, both 4-fold out-of-fold on dev folds | ≈ 1.3 h |
+| ce | `python main.py ce` | **cross-encoder** (GPU). Export the pairs with stage-2 probability in [0.01, 0.999) and in the S1's top 8 (4.0M train / 3.6M test). Fine-tune two half-models (A: folds 1–2, B: folds 3–4) and score each pair with the one that never saw its S1 (holdout / test: A or B by S1 hash). Then stage 3 with `ce_logit`, out-of-fold on dev folds | ≈ 2 h GPU + 40 min CPU |
 | holdout | `python main.py holdout` | score on the holdout fold 0 | 5 min |
 | fit | `python main.py fit` | stage-2 and stage-3 models on all training data | 30 min |
 | infer | `python main.py infer` | test: candidates/features if missing → stage 2 → pseudo-label adaptation for countries absent from training → stage 3 → decision policy → `output/*.tsv` → self-check + official validator | 30 min |
 
-The final configuration is **v3 + house-number relation features with an acceptance threshold of 0.9** (tags `inv3n` / `s3inv3n`, policy `thr0.9`; public leaderboard 0.977). v3 is v2 without two scale-shifted IDF features. The house-number features (`features_num.py`) separate neighbouring premises from corrupted house numbers. The earlier v1 (`train.py --stack`, `final.py fit/infer`) and v2 (`inv2` / `s3inv2`) configurations are kept for the ablation record.
+The final configuration is **v3 + house-number relation features + cross-encoder, with an acceptance threshold of 0.9** (tags `inv3n` / `s3inv3n_ce`, policy `thr0.9`; public leaderboard **0.983**). v3 is v2 without two scale-shifted IDF features. The house-number features (`features_num.py`) separate neighbouring premises from corrupted house numbers. The cross-encoder (`ce_export.py`, `ce_train.py`, `final2.py --ce`) adds one stage-3 feature. The earlier v1 (`train.py --stack`, `final.py fit/infer`), v2 (`inv2` / `s3inv2`) and pre-CE (`s3inv3n`, leaderboard 0.977) configurations are kept for the ablation record.
 
 **Analysis and diagnostic tools** (development only):
 
@@ -84,6 +92,9 @@ The final configuration is **v3 + house-number relation features with an accepta
 | `r1_eval.py` | R1 evidence-conditional decision (`decision.conditional_policy`, `final2.py --policy cond_num`) and X2 stage-3-under-injection check (tested, not adopted) |
 | `r4_audit.py` | R4 samples of residual house-number FN/FP pairs (no new features justified) |
 | `r5_check.py` | R5 fold-averaged test-time stage 2 (`exp.py --save-models`, `final2.py --s2-avg`) vs full model, KS distance to dev OOF (tested, not adopted) |
+| `ce_train.py pilot [model ...] [--light]` | cross-encoder pilots on a 200k-pair sample with pre-registered gates (single model vs stage 3; larger vs smaller model) |
+| `ce_domain.py` | train-vs-test domain AUC with and without the CE logit, against reference pair features |
+| `ce_leak.py` | memorisation check: CE gain on records the scoring half-model saw in training vs never saw |
 | `bench_block.py`, `bench_miss.py` | blocking recall benchmark and miss analysis |
 | `eda.py` | exploratory data analysis |
 
@@ -118,6 +129,8 @@ src/
   stack.py           stage-3 set-level features (S1 profile, competition, sibling support)
   adapt.py           pseudo-label adaptation for unseen countries (+ LOCO simulation)
   decision.py        threshold / expected-F0.5 set selection, one-owner exclusivity
+  ce_export.py       cross-encoder pair subset (stage-2 probability rule) → entity-id pair lists
+  ce_train.py        cross-encoder fine-tuning (2-way cross-fitting) and scoring, GPU
   evaluation.py      exact competition macro F0.5 + diagnostics, paired bootstrap
   error_analysis.py  error taxonomy + examples
   final.py           holdout evaluation (both versions); v1 fit/inference

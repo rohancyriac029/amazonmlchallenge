@@ -1,10 +1,13 @@
-"""End-to-end pipeline (final = shift-robust v3 + house-number relation features, threshold 0.9): data -> normalization -> blocking -> matching -> output.
+"""End-to-end pipeline (final = shift-robust v3 + house-number relation features + cross-encoder, threshold 0.9):
+data -> normalization -> blocking -> matching -> output.
 
   python main.py all        # everything below, in order
   python main.py prep       # folds, transliteration dictionary (dev folds only), normalization
   python main.py cands      # candidate generation (train + test)
   python main.py features   # stage-1 ranker + top-25 pruning + pair/context features, IDF-weighted similarities
   python main.py validate   # stage-2 (composition-invariant) and stage-3 (stacking) out-of-fold on dev folds
+  python main.py ce         # cross-encoder (needs a CUDA GPU): pair export, 2-way cross-fitted fine-tuning,
+                            # scoring, stage 3 with the CE logit (out-of-fold on dev folds)
   python main.py holdout    # score on the holdout fold (fold 0)
   python main.py fit        # final stage-2 + stage-3 models on all training data
   python main.py infer      # test inference -> output/matching_results.tsv, output/candidate_pairs.tsv + validator
@@ -13,7 +16,7 @@ import subprocess
 import sys
 
 POLICY = "thr0.9"   # robust to near-copy distractor density (E1 shift suite + leaderboard confirmation)
-S2, TAG = "inv3n", "s3inv3n"
+S2, TAG0, TAG = "inv3n", "s3inv3n", "s3inv3n_ce"   # TAG0: stage 3 without the CE (defines the CE pair subset)
 
 
 def sh(*args):
@@ -37,7 +40,14 @@ def main(stage):
         # plus house-number relation features (N)
         sh("exp.py", "--tag", S2, "--train", "normal", "--evals", "normal",
            "--invariant", "size+comp+s1", "--extra", "A8N")
-        sh("final2.py", "stack", "--s2", S2, "--tag", TAG)
+        sh("final2.py", "stack", "--s2", S2, "--tag", TAG0)
+    if stage in ("ce", "all"):
+        sh("final2.py", "fit", "--s2", S2, "--tag", TAG0)   # full stage-2 model: selects the test pairs the CE scores
+        sh("ce_export.py", "export")
+        sh("ce_train.py", "train", "A")                     # folds 1-2 -> scores folds 3-4
+        sh("ce_train.py", "train", "B")                     # folds 3-4 -> scores folds 1-2
+        sh("ce_train.py", "score")                          # holdout / test pairs: A or B by S1 hash
+        sh("final2.py", "stack", "--s2", S2, "--tag", TAG, "--ce")
     if stage in ("holdout", "all"):
         sh("final.py", "holdout", "--tag", TAG, "--policy", POLICY)
     if stage in ("fit", "all"):

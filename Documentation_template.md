@@ -2,7 +2,7 @@
 
 **Team Name:** [Your Team Name]  
 **Team Members:** [List all team members]  
-**Submission Date:** 2026-09-26
+**Submission Date:** 2026-09-27
 
 ---
 
@@ -22,20 +22,23 @@ Key techniques:
 - name×locality conjunction blocking keys
 - stacking with graph-style consistency features
 - pseudo-label adaptation for countries that are unseen in training (France)
+- a fine-tuned multilingual **cross-encoder** (`multilingual-e5-small`, MIT, 118M parameters) whose pair score feeds stage 3
 
 The final model (**v2**) is additionally made **robust to dataset shift**. A train-vs-test domain classifier showed that features encoding the *composition* of a dataset do not transfer to test. These are raw name-frequency counts, raw competition gaps between S1 entities, and the stage-1 score that folds both in. Stage 2 drops them and uses country-relative IDF-weighted similarities instead. Competition between S1 entities is re-introduced only in stage 3, through probabilities.
 
 Results:
 
-| | v1 | v2 | v3 @ thr 0.9 | **v3 + house-number features @ thr 0.9 (final)** |
-|---|---|---|---|---|
-| Public leaderboard (macro F0.5) | 0.960 | 0.974 | 0.975 | **0.977** |
-| Holdout fold (training distribution) | 0.9840 | 0.9841 | 0.9810 | **0.9829** |
-| Dev 4-fold OOF | 0.9830 ± 0.0001 | 0.9833 ± 0.0001 | 0.9805\* | **0.9824**\* |
+| | v1 | v2 | v3 @ thr 0.9 | v3 + house-number @ thr 0.9 | **+ cross-encoder @ thr 0.9 (final)** |
+|---|---|---|---|---|---|
+| Public leaderboard (macro F0.5) | 0.960 | 0.974 | 0.975 | 0.977 | **0.983** |
+| Holdout fold (training distribution) | 0.9840 | 0.9841 | 0.9810 | 0.9829 | **0.9884** |
+| Dev 4-fold OOF | 0.9830 ± 0.0001 | 0.9833 ± 0.0001 | 0.9805\* | 0.9824\* | **0.9881**\* |
 
-\* Under the 0.9 threshold. With the expected-F rule, the same models score 0.9828 (v3) and **0.9842** (final) on dev. The threshold deliberately trades in-distribution recall for robustness to near-copy distractors (§5.6). Seed noise on dev is ±0.00007 (3 seeds, §5.8).
+\* Under the 0.9 threshold. With the expected-F rule, the same models score 0.9828 (v3), 0.9842 (house-number) and 0.9884 (final) on dev. The threshold deliberately trades in-distribution recall for robustness to near-copy distractors (§5.6). Seed noise on dev is ±0.00007 (3 seeds, §5.8).
 
 The last step (§5.8) added **house-number relation features**. The model can now tell *neighbouring premises* (a distractor a few doors away, typically on the other side of the street) from a *corrupted house number* (a typo or truncation on a true match). That cut house-number misses by 34% and the related false merges by 22%.
+
+The final step (§5.10) added a **cross-encoder**: a small multilingual transformer fine-tuned on the supplied training pairs, which reads both records' raw text jointly. Its score is one extra stage-3 feature. Cross-fitting keeps it out-of-fold. It cut dev false merges by 60% and missed matches by 20%, and raised the leaderboard from 0.977 to **0.983**, the same size as its holdout gain.
 
 ---
 
@@ -157,7 +160,7 @@ Noise patterns observed:
 - **Competition:** best P of any other S1 for the same record, rank within the record, and the number of confident S1 claimants.
 - **Sibling support:** against the S1's other confident candidates (up to 6), the maximum and mean name/address token-set similarity, the maximum of min(name, address), a P-weighted version, same house number, and same source.
 
-**Model type:** LightGBM binary GBDT with 127 leaves, learning rate 0.08, 600 rounds, feature/bagging fraction 0.8 (MIT licence, trained from scratch, about 2×10⁵ learned split/leaf values; far below the 8B limit). No pretrained or external model is used.
+**Model type:** LightGBM binary GBDT with 127 leaves, learning rate 0.08, 600 rounds, feature/bagging fraction 0.8 (MIT licence, trained from scratch, about 2×10⁵ learned split/leaf values; far below the 8B limit). Stage 3 additionally uses the logit of a cross-encoder fine-tuned from `intfloat/multilingual-e5-small` (MIT licence, 118M parameters; §5.10). No other pretrained or external model is used.
 
 **Threshold / decision selection** (`decision.py`, chosen on dev folds only):
 
@@ -475,15 +478,51 @@ Each experiment's acceptance rule was fixed before it ran. **The leaderboard was
 
 The final submission is unchanged (**public leaderboard 0.977**).
 
+## 5.10 Cross-encoder pair model
+
+**Motivation.** Leaderboard scores near 0.99 implied that others were extracting signal we were not. We first ruled out a data leak:
+
+- Entity IDs of matched records are uncorrelated (Spearman 0.0001), and so is row order (0.001).
+- No test record's name + address occurs in train.
+
+So the gap had to come from modelling. Until now every model was gradient boosting on hand-built features. The rules' ≤ 8B-parameter, MIT/Apache clause allows a pretrained text model.
+
+**Design** (`ce_export.py`, `ce_train.py`, `final2.py --ce`):
+
+- **Model.** `intfloat/multilingual-e5-small` (MIT licence, 118M parameters, 1.5% of the 8B limit), used only as the initialisation. It is fine-tuned as a cross-encoder on the supplied training pairs: `S1 "name | address"` [SEP] `candidate "name | address"`, mean pooling, one linear logit. It reads Devanagari and Latin script natively. No external data, API or lookup is involved.
+- **Pairs scored.** The CE scores a pair when its stage-2 probability is in [0.01, 0.999) and it ranks in its S1's top 8. That is 4.0M train and 3.57M test pairs, covering 97% of dev missed matches and 97% of false matches of the previous final model. Other pairs get a missing value.
+- **Cross-fitting.** Model A trains on dev folds 1–2 and scores folds 3–4; model B does the reverse. Holdout and test pairs are scored by A or B, chosen by a hash of the S1 id. So every pair is scored by exactly one model that never saw its S1.
+- **Training.** 1M pairs per half-model (70% from the uncertain zone 0.02 < p2 < 0.98), one epoch, learning rate 5×10⁻⁵, bf16, up to 96 tokens. On one 6 GB laptop GPU (RTX 4050): ~28 min per half-model, scoring at ~2,900 pairs/s.
+- **Integration.** Stage 3 gets exactly one new feature, `ce_logit` (105 features). Stage 2 and the decision rule (thr 0.9 + exclusivity) are unchanged.
+
+**Pilot gate** (fixed before running): a CE trained on only 200k pairs had to cut stage-3 pair errors at thr 0.9 by ≥ 2% on held-out S1s. It cut them by **16.4%** (2,026 → 1,693), and log-loss fell 0.0434 → 0.0358.
+
+**Pre-registered acceptance checks:**
+
+| Check | Result |
+|---|---|
+| Dev, thr 0.9 (bootstrap) | 0.98239 → **0.98809**, +0.00571 [95% CI +0.00562, +0.00580], about 80× the seed std |
+| Dev, expected-F | 0.98420 → 0.98842, +0.00422 [+0.00414, +0.00430] |
+| Error counts (dev, thr 0.9) | false merges 9,100 → **3,631** (−60%); missed 270,995 → 215,767 (−20%) |
+| Per class (dev, thr 0.9, FN / FP) | Every class improves. Indic names 4,184 → 1,103 / 442 → 115. House number differs 30,966 → 8,238 / 2,425 → 839. DBA 19,555 → 13,388 / 1,050 → 509. "Other" 21,194 → 3,353 / 3,570 → 860. No-address 76,169 → 73,104 / 1,283 → 1,219. |
+| Memorisation (`ce_leak.py`) | Folds split S1 entities, but an S2/S3 record can occur in a CE training pair and later as a candidate of a scored S1; test shares no records with train. Pair errors fall **57%** on records the scoring model *never saw* in training, vs 5.5% on records it saw. The gain does not come from memorisation. |
+| Train-vs-test shift (`ce_domain.py`) | Rise in domain AUC over the stage-2 probability alone: US +0.022, India +0.015. **Above the pre-registered +0.01**; that limit was set against too weak a base. The trusted address similarity `a_tset` gives +0.053 / +0.024, and name similarity `n_tset` +0.025 / +0.008. The CE's shift is within the range of ordinary pair features. |
+| Holdout (fifth scoring; no decision used it) | 0.9829 → **0.9884** (India 0.9879, US 0.9887), consistent with dev |
+| Leaderboard (one pre-declared confirmation, veto only) | 0.977 → **0.983** (+0.006, matching the holdout gain of +0.0055). **Adopted as the final model.** |
+
+**A construction error the shift check caught.** The first version scored holdout and test pairs with the *mean* of A and B. Each half-model saturates at its own logit plateaus, so the mean falls between them, at values stage 3 never saw in training. Dev-vs-test domain AUC rose by **+0.37 (US) and +0.43 (India)**. Rounding to the bf16 grid did not help (+0.35), which ruled out a numeric-precision explanation. Scoring each holdout/test pair with a single half-model brought the rise to the +0.02 level above. Dev results are unaffected: dev pairs were always scored by one model.
+
+**Cost.** Two GPU runs of ~2.5 h on a laptop (free). About 3 h of EC2 CPU time for export and stage-3 evaluation; the instance was stopped while the GPU ran.
+
 ---
 
 ## 6. Conclusion
 
 Careful blocking (name×locality conjunctions, transliteration-aware normalisation) and a learned ranker give a 0.981 recall ceiling at 25 candidates per entity. Pairwise gradient boosting, set-level stacking and an exclusivity-aware expected-F0.5 decision layer reach 0.984 on the holdout.
 
-The largest real-world gain came from **generalisation**. We diagnosed, label-free, that composition-dependent features did not transfer to the test set. Replacing them with invariant and country-relative ones raised the public leaderboard from 0.960 to **0.974**, at no cost in-distribution. An audit-driven follow-up removed a further scale-shifted feature pair (v3) and adopted a distractor-robust acceptance threshold, supported by a measured near-copy shift simulation (0.975). A final evidence-driven step added pair-relational house-number features, which separate neighbouring premises from corrupted numbers, for a final **0.977**.
+The largest real-world gain came from **generalisation**. We diagnosed, label-free, that composition-dependent features did not transfer to the test set. Replacing them with invariant and country-relative ones raised the public leaderboard from 0.960 to **0.974**, at no cost in-distribution. An audit-driven follow-up removed a further scale-shifted feature pair (v3) and adopted a distractor-robust acceptance threshold, supported by a measured near-copy shift simulation (0.975). A final evidence-driven step added pair-relational house-number features, which separate neighbouring premises from corrupted numbers, for **0.977**. A fine-tuned multilingual cross-encoder, one extra stage-3 feature trained with cross-fitting on a laptop GPU, gave the final **0.983**.
 
-The main lesson: features describing *the dataset* rather than *the pair* are a hidden overfitting risk in entity resolution. A train-vs-test domain classifier is a cheap way to find them.
+The main lesson: features describing *the dataset* rather than *the pair* are a hidden overfitting risk in entity resolution. A train-vs-test domain classifier is a cheap way to find them, and the same check caught a construction error in the cross-encoder's test-time scoring (§5.10) before it reached a submission.
 
 ---
 
@@ -495,7 +534,7 @@ The main lesson: features describing *the dataset* rather than *the pair* are a 
 
 ```
 src/
-  main.py            end-to-end orchestration: prep → cands → validate → holdout → fit → infer
+  main.py            end-to-end orchestration: prep → cands → features → validate → ce → holdout → fit → infer
   prep.py            folds, transliteration dictionary (train folds only), normalization → parquet
   normalization.py   Indic transliteration, acronym decoding, name/address representations
   translit_dict.py   learned transliteration dictionary
@@ -512,6 +551,9 @@ src/
   final.py           holdout scoring (v1 and v2), v1 fit/inference
   final2.py          final v2: composition-invariant stage 2 + stage-3 stacking, fit, test inference
   features_idf.py    country-relative IDF-weighted similarities
+  ce_export.py       cross-encoder pair subset → entity-id pair lists
+  ce_train.py        cross-encoder fine-tuning (2-way cross-fitting), scoring, pilots (GPU)
+  ce_domain.py       CE train-vs-test shift check;  ce_leak.py  CE memorisation check
   exp.py             generalisation experiments (invariant feature sets, LOCO, simulations)
   diag_*.py, probe.py, prior_shift.py, dense.py   label-free shift diagnostics and negative-result experiments
   evaluation.py      exact macro F0.5 + diagnostics, paired bootstrap
@@ -531,5 +573,5 @@ Reproduce: `cd src && ER_ROOT=<student_resource> python main.py all`. This write
   - 4-fold OOF: 35 min
   - stacking features: 8 min
 - **Reproducibility:** fixed seeds (42), deterministic md5 folds, pinned requirements, and all intermediate artefacts cached under `work/`.
-- **License compliance:** numpy, pandas, scipy (BSD); pyarrow (Apache-2.0); lightgbm (MIT); rapidfuzz (MIT); sparse_dot_topn (Apache-2.0). The only models are LightGBM models trained from scratch; there are no pretrained weights or LLMs.
-- **No-external-data compliance:** the code makes no network calls, uses no geocoding, registries or lookups, and uses no external data. It uses only the challenge TSVs. Linguistic normalisation tables (abbreviations, legal forms, letter names, the Indic script layout) are generic rules written in code. The transliteration dictionary is learned from training pairs only.
+- **License compliance:** numpy, pandas, scipy (BSD); pyarrow (Apache-2.0); lightgbm (MIT); rapidfuzz (MIT); sparse_dot_topn (Apache-2.0); scikit-learn (BSD); torch (BSD); transformers (Apache-2.0). The models are LightGBM models trained from scratch plus one cross-encoder fine-tuned from `intfloat/multilingual-e5-small` (MIT licence, 118M parameters, 1.5% of the 8B limit). No LLM is used.
+- **No-external-data compliance:** apart from fetching the pretrained cross-encoder initialisation (model weights, not data; `ER_CE_MODEL` can point to a local copy), the code makes no network calls, uses no geocoding, registries or lookups, and uses no external data. It uses only the challenge TSVs. Linguistic normalisation tables (abbreviations, legal forms, letter names, the Indic script layout) are generic rules written in code. The transliteration dictionary is learned from training pairs only.

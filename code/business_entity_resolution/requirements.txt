@@ -6,3 +6,8 @@ scipy==1.15.2
 lightgbm==4.7.0
 rapidfuzz==3.14.5
 sparse_dot_topn==1.2.0
+scikit-learn==1.7.0
+# cross-encoder step (ce_train.py, run on a CUDA GPU; tested on Windows 11 + RTX 4050, Python 3.13)
+torch==2.7.1           # BSD-3-Clause
+transformers==4.57.6   # Apache-2.0
+# pretrained initialisation: intfloat/multilingual-e5-small (MIT, 118M parameters)

@@ -4,7 +4,7 @@ Stage-2 features exclude dataset-composition dependent inputs (raw ambiguity
 counts, raw competition gaps/ranks, stage-1 score), chosen with a train-vs-test
 domain classifier; optionally adds the IDF-weighted similarities of change A.
 
-  python final2.py stack  --s2 inv2 --tag s3inv2 [--no-comp]   stage-3 OOF on dev folds + report
+  python final2.py stack  --s2 inv2 --tag s3inv2 [--no-comp] [--ce]   stage-3 OOF on dev folds + report
   python final2.py fit    --s2 inv2 --tag s3inv2               full stage-2 and stage-3 models
   python final2.py infer  --tag s3inv2 --policy expF_gate0.6   test inference, outputs, validator
 """
@@ -44,12 +44,37 @@ def s2_spec(s2tag):
     return {"base_cols": [c for c in allc if c not in drop], "extra": rec.get("extra", ""), "params": rec.get("params", "default")}
 
 
-def matrix(split_table, spec, extra_df=None):
+def ce_logit(split, n):
+    """Cross-encoder logit per pair of <split>_feat (NaN where the CE did not score; see ce_export/ce_train)."""
+    v = np.full(n, np.nan, np.float32)
+    v[pd.read_parquet(config.work(f"ce_pairs_{split}.parquet"), columns=["row"]).row.values] =         np.load(config.work(f"ce_logit_{split}.npy"))
+    return v
+
+
+def matrix(split_table, spec, extra_df=None, rows=None):
     X, meta, cols = exp.load(split_table, spec["base_cols"], spec["extra"])
+    if rows is not None:                 # keep only these rows before widening (peak memory)
+        X, meta = X[rows], meta.iloc[rows]
     if extra_df is not None:
-        X = np.hstack([X, extra_df.values.astype(np.float32)])
+        E = extra_df if rows is None else extra_df.iloc[rows]
+        X = np.hstack([X, E.values.astype(np.float32)])
         cols = cols + list(extra_df.columns)
     return X, meta, cols
+
+
+def ensure_test_features(spec):
+    """Build the test candidate, pair-feature, IDF (A) and house-number (N) tables if missing."""
+    if not os.path.exists(config.work("test_cands.parquet")):
+        import candidates
+        candidates.run("test")
+    if not os.path.exists(config.work("test_feat.parquet")):
+        train.build("test")                      # stage-1 pruning + pair/context features
+    if spec["extra"] and not os.path.exists(config.work("test_feat_A.parquet")):
+        import features_idf
+        features_idf.build("test", "test_feat")
+    if spec["extra"] == "A8N" and not os.path.exists(config.work("test_feat_N.parquet")):
+        import features_num
+        features_num.build("test", "test_feat")
 
 
 def stack_cmd(a):
@@ -66,6 +91,8 @@ def stack_cmd(a):
         S.to_parquet(path, index=False)
     if a.no_comp:
         S = S.drop(columns=COMP_PROB)
+    if a.ce:
+        S["ce_logit"] = ce_logit("train", len(S))
     X, _, cols = matrix("train_feat", spec, S)
     print(f"stage-3 features {len(cols)} ({time.time() - t0:.0f}s)", flush=True)
     prob, _ = train.oof(X, meta, cols)
@@ -82,7 +109,7 @@ def stack_cmd(a):
             print(f"{a.tag} vs stack1 ({k}): {d:+.5f} [{lo:+.5f}, {hi:+.5f}]")
         train.log_experiment({"tag": a.tag, "s2": a.s2, "no_comp": a.no_comp, "policy": k, "stage": 3,
                               **{kk: v for kk, v in r.items() if not kk.startswith("_")}})
-    json.dump({"s2": a.s2, "spec": spec, "no_comp": a.no_comp},
+    json.dump({"s2": a.s2, "spec": spec, "no_comp": a.no_comp, "ce": a.ce},
               open(config.work(f"spec_{a.tag}.json"), "w"))
 
 
@@ -91,15 +118,17 @@ def fit_cmd(a):
     spec = sp["spec"]
     meta = pd.read_parquet(config.work("train_feat.parquet"), columns=["q", "p", "y", "fold"])
     idx = train._subsample(meta.q.values, np.arange(len(meta)), 15_000_000, 7)
-    X, _, cols2 = matrix("train_feat", spec)
-    m2 = exp.fit(X[idx], meta.y.values[idx], cols2, spec["params"])
+    X, _, cols2 = matrix("train_feat", spec, rows=idx)
+    m2 = exp.fit(X, meta.y.values[idx], cols2, spec["params"])
     m2.save_model(config.work(f"stage2_{a.tag}.txt"))
     del X
     S = pd.read_parquet(config.work(f"train_stack_{sp['s2']}.parquet"))
     if sp["no_comp"]:
         S = S.drop(columns=COMP_PROB)
-    X, _, cols3 = matrix("train_feat", spec, S)
-    m3 = train.fit(X[idx], meta.y.values[idx], cols3, 600)
+    if sp.get("ce"):
+        S["ce_logit"] = ce_logit("train", len(S))
+    X, _, cols3 = matrix("train_feat", spec, S, rows=idx)
+    m3 = train.fit(X, meta.y.values[idx], cols3, 600)
     m3.save_model(config.work(f"stage3_{a.tag}.txt"))
     countries = sorted(pd.read_parquet(config.work("train_v1.parquet"), columns=["country"]).country.unique())
     json.dump({**sp, "cols2": cols2, "cols3": cols3, "train_countries": countries},
@@ -112,17 +141,7 @@ def infer_cmd(a):
     from submission import write_sets, self_check
     sp = json.load(open(config.work(f"spec_{a.tag}.json")))
     spec = sp["spec"]
-    if not os.path.exists(config.work("test_cands.parquet")):
-        import candidates
-        candidates.run("test")
-    if not os.path.exists(config.work("test_feat.parquet")):
-        train.build("test")                      # stage-1 pruning + pair/context features
-    if spec["extra"] and not os.path.exists(config.work("test_feat_A.parquet")):
-        import features_idf
-        features_idf.build("test", "test_feat")
-    if spec["extra"] == "A8N" and not os.path.exists(config.work("test_feat_N.parquet")):
-        import features_num
-        features_num.build("test", "test_feat")
+    ensure_test_features(spec)
     X, meta, cols2 = matrix("test_feat", spec)
     assert cols2 == sp["cols2"]
     if a.s2_avg:   # R5: mean of the 4 dev-fold stage-2 models, matching the OOF inputs stage 3 was trained on
@@ -139,7 +158,7 @@ def infer_cmd(a):
         if unseen:
             tr = pd.read_parquet(config.work("train_feat.parquet"), columns=["q", "y"])
             src = train._subsample(tr.q.values, np.arange(len(tr)), 12_000_000, 3)
-            Xs = matrix("train_feat", spec)[0][src]
+            Xs = matrix("train_feat", spec, rows=src)[0]
             for c in unseen:
                 tgt = np.flatnonzero(cty == c)
                 yp = adapt.pseudo_labels(meta.q.values[tgt], meta.p.values[tgt], p2[tgt])
@@ -151,6 +170,8 @@ def infer_cmd(a):
     S = stack.stack_features(df, meta, p2.astype(np.float32))
     if sp["no_comp"]:
         S = S.drop(columns=COMP_PROB)
+    if sp.get("ce"):
+        S["ce_logit"] = ce_logit("test", len(S))
     X, _, cols3 = matrix("test_feat", spec, S)
     assert cols3 == sp["cols3"]
     meta["prob"] = lgb.Booster(model_file=config.work(f"stage3_{a.tag}.txt")).predict(X, num_threads=config.N_JOBS)
@@ -182,6 +203,7 @@ if __name__ == "__main__":
     ap.add_argument("--s2", default="inv2")
     ap.add_argument("--tag", default="s3inv2")
     ap.add_argument("--no-comp", action="store_true")
+    ap.add_argument("--ce", action="store_true", help="add the cross-encoder logit to stage 3 (ce_export.py, ce_train.py)")
     ap.add_argument("--policy", default="expF_gate0.6")
     ap.add_argument("--adapt", action="store_true")
     ap.add_argument("--final", action="store_true", help="write to output/ instead of output/<tag>/")
