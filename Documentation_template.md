@@ -23,18 +23,19 @@ Key techniques:
 - stacking with graph-style consistency features
 - pseudo-label adaptation for countries that are unseen in training (France)
 - a fine-tuned multilingual **cross-encoder** (`multilingual-e5-small`, MIT, 118M parameters) whose pair score feeds stage 3
+- **self-training** of the cross-encoder on its own confident predictions for France, validated on a simulation that holds India out
 
 The final model (**v2**) is additionally made **robust to dataset shift**. A train-vs-test domain classifier showed that features encoding the *composition* of a dataset do not transfer to test. These are raw name-frequency counts, raw competition gaps between S1 entities, and the stage-1 score that folds both in. Stage 2 drops them and uses country-relative IDF-weighted similarities instead. Competition between S1 entities is re-introduced only in stage 3, through probabilities.
 
 Results:
 
-| | v1 | v2 | v3 @ thr 0.9 | v3 + house-number @ thr 0.9 | **+ cross-encoder @ thr 0.9 (final)** |
+| | v1 | v2 | v3 @ thr 0.9 | v3 + house-number @ thr 0.9 | **+ cross-encoder @ thr 0.9 (final†)** |
 |---|---|---|---|---|---|
 | Public leaderboard (macro F0.5) | 0.960 | 0.974 | 0.975 | 0.977 | **0.983** |
 | Holdout fold (training distribution) | 0.9840 | 0.9841 | 0.9810 | 0.9829 | **0.9884** |
 | Dev 4-fold OOF | 0.9830 ± 0.0001 | 0.9833 ± 0.0001 | 0.9805\* | 0.9824\* | **0.9881**\* |
 
-\* Under the 0.9 threshold. With the expected-F rule, the same models score 0.9828 (v3), 0.9842 (house-number) and 0.9884 (final) on dev. The threshold deliberately trades in-distribution recall for robustness to near-copy distractors (§5.6). Seed noise on dev is ±0.00007 (3 seeds, §5.8).
+\* Under the 0.9 threshold. With the expected-F rule, the same models score 0.9828 (v3), 0.9842 (house-number) and 0.9884 (final) on dev. † France (15% of test, absent from training) is scored by the self-trained cross-encoder (§5.11); dev and holdout contain no French entities, so they are unchanged. The threshold deliberately trades in-distribution recall for robustness to near-copy distractors (§5.6). Seed noise on dev is ±0.00007 (3 seeds, §5.8).
 
 The last step (§5.8) added **house-number relation features**. The model can now tell *neighbouring premises* (a distractor a few doors away, typically on the other side of the street) from a *corrupted house number* (a typo or truncation on a true match). That cut house-number misses by 34% and the related false merges by 22%.
 
@@ -514,13 +515,54 @@ So the gap had to come from modelling. Until now every model was gradient boosti
 
 **Cost.** Two GPU runs of ~2.5 h on a laptop (free). About 3 h of EC2 CPU time for export and stage-3 evaluation; the instance was stopped while the GPU ran.
 
+## 5.11 After 0.983: a rejected scaling pilot and self-training for France
+
+**Scaling pilot (rejected).** `multilingual-e5-base` (MIT, 278M) vs the small model, trained on the same 200k pairs with the same memory-light recipe (frozen word embeddings, activation checkpointing). Evaluation pairs: 39,768 held-out pairs of 17,796 S1s.
+
+| | Pair errors at thr 0.9 | vs stage 3 alone |
+|---|---|---|
+| stage 3 alone | 1,951 | — |
+| + small CE | 1,659 | −15.0% |
+| + base CE | 1,515 | −22.3% |
+| + both | 1,519 | −22.1% |
+
+The pre-registered gate required base to beat small by ≥ 10%; it did so by 8.7%. **Rejected.** The ensemble also adds nothing.
+
+**Where the remaining loss is** (`diag_residual.py`, dev thr 0.9, total loss 0.0119):
+
+- *Partially matched S1:* 0.0090, mostly missed name-only records.
+- *Non-singletons predicted empty:* 0.0028 (4,856 S1). Most have no correct candidate at all: blocking misses. A top-1 fallback for 0.5 ≤ P < 0.9 nets about +0.0001, because 620 true singletons in those bands would lose a full point. Not pursued.
+- *Singletons given matches:* 0.0001.
+
+**Test composition.** Test is 47% India, 38% US and **15% France**, which is absent from training (train: 60% US, 40% India). Name-only records are *rarer* in test (2.7% vs 3.3%). On test, 1.6% of French S1 have a best candidate in (0.1, 0.99], vs 0.4–0.5% for US and India. The uncertain French cases are mostly same-address pairs with one French "type word" swapped (e.g. *Hotel* vs *Club*), plus region vs department in the address (*Nouvelle-Aquitaine* vs *Gironde*).
+
+**Self-training for the unseen country** (`ce_loco.py`, `ce_train.py adapt`). The cross-encoder continues fine-tuning on the system's *own confident predictions* for that country's test pairs (pseudo-labels: P ≥ 0.97 → match, ≤ 0.03 → non-match), mixed 1:1 with labelled training pairs, at learning rate 2×10⁻⁵ for one epoch. No test label exists or is used.
+
+**Validation first, on a simulation with India as the unseen country.** Stage 2 is the US-only model; the cross-encoder is fine-tuned on US pairs only; a logistic combiner fitted on held-out US pairs stands in for stage 3. It is evaluated on India dev folds 1–4, with the holdout excluded. Pre-registered gate: India macro F0.5 +0.002 or more, with CI above 0.
+
+| India dev (unseen country) | Macro F0.5 | CE AUC on India |
+|---|---|---|
+| US-only stage 2 | 0.92671 | — |
+| + US-only cross-encoder | 0.93578 | 0.898 |
+| **+ self-training on India pseudo-labels** | **0.94790** (P 0.9737, R 0.8971) | **0.939** |
+
+The gain is **+0.0121 [95% CI +0.0119, +0.0123]**. It was unchanged (+0.0121) with the combiner *frozen*, as stage 3 is in production. The pseudo-labels were 98.3% correct for matches and 95.7% for non-matches (India labels were used only to report this).
+
+**Applied to France.** Of 650,267 CE-scored French test pairs, 518,639 got pseudo-labels (160,551 match, 358,088 non-match). Each half-model was adapted on 300k of them plus 300k of its own labelled pairs; only French pairs were rescored.
+
+- 22,165 of 259,452 French S1 changed (+17,899 links, −5,558). US and India are byte-identical.
+- French matches per S1 rose from 3.229 to 3.276 and the empty rate fell from 5.95% to 5.80%. This is the same direction as the simulation, where recall rose.
+- Dev and holdout are unaffected, since France is not in training.
+
+**Leaderboard:** 0.983 → **0.983**. With France at 15% of test, the expected overall gain (about +0.0005 to +0.002) is at or below the leaderboard's display resolution. Under the rule fixed before the submission (the leaderboard is a veto only, and the evidence is the pre-registered simulation), **it is adopted as the final model**. The pre-adaptation submission is kept as a separate snapshot (git tag `v0.983`).
+
 ---
 
 ## 6. Conclusion
 
 Careful blocking (name×locality conjunctions, transliteration-aware normalisation) and a learned ranker give a 0.981 recall ceiling at 25 candidates per entity. Pairwise gradient boosting, set-level stacking and an exclusivity-aware expected-F0.5 decision layer reach 0.984 on the holdout.
 
-The largest real-world gain came from **generalisation**. We diagnosed, label-free, that composition-dependent features did not transfer to the test set. Replacing them with invariant and country-relative ones raised the public leaderboard from 0.960 to **0.974**, at no cost in-distribution. An audit-driven follow-up removed a further scale-shifted feature pair (v3) and adopted a distractor-robust acceptance threshold, supported by a measured near-copy shift simulation (0.975). A final evidence-driven step added pair-relational house-number features, which separate neighbouring premises from corrupted numbers, for **0.977**. A fine-tuned multilingual cross-encoder, one extra stage-3 feature trained with cross-fitting on a laptop GPU, gave the final **0.983**.
+The largest real-world gain came from **generalisation**. We diagnosed, label-free, that composition-dependent features did not transfer to the test set. Replacing them with invariant and country-relative ones raised the public leaderboard from 0.960 to **0.974**, at no cost in-distribution. An audit-driven follow-up removed a further scale-shifted feature pair (v3) and adopted a distractor-robust acceptance threshold, supported by a measured near-copy shift simulation (0.975). A final evidence-driven step added pair-relational house-number features, which separate neighbouring premises from corrupted numbers, for **0.977**. A fine-tuned multilingual cross-encoder, one extra stage-3 feature trained with cross-fitting on a laptop GPU, gave **0.983**. Self-training it on its own confident French predictions, validated by holding India out as a simulated unseen country (+0.0121 there), became the final model (leaderboard 0.983, unchanged at three decimals).
 
 The main lesson: features describing *the dataset* rather than *the pair* are a hidden overfitting risk in entity resolution. A train-vs-test domain classifier is a cheap way to find them, and the same check caught a construction error in the cross-encoder's test-time scoring (§5.10) before it reached a submission.
 
@@ -554,6 +596,8 @@ src/
   ce_export.py       cross-encoder pair subset → entity-id pair lists
   ce_train.py        cross-encoder fine-tuning (2-way cross-fitting), scoring, pilots (GPU)
   ce_domain.py       CE train-vs-test shift check;  ce_leak.py  CE memorisation check
+  ce_loco.py         unseen-country simulation (India held out) for CE self-training
+  diag_residual.py   residual-loss decomposition;  diag_france.py  France confidence profile (label-free)
   exp.py             generalisation experiments (invariant feature sets, LOCO, simulations)
   diag_*.py, probe.py, prior_shift.py, dense.py   label-free shift diagnostics and negative-result experiments
   evaluation.py      exact macro F0.5 + diagnostics, paired bootstrap

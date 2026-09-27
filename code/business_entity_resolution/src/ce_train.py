@@ -13,10 +13,16 @@ Every pair is scored by exactly ONE half-model, as the dev pairs stage 3 is trai
 the mean lands between them, and dev-vs-test domain AUC rose to 0.89-0.95; see ce_domain.py.)
 
   python ce_train.py pilot [model ...] [--light]   200k-sample pilot(s); pre-registered gates on held-out S1s
-  python ce_train.py train A|B    fine-tune one half                 -> work/ce_model_{A,B}.pt
-  python ce_train.py score        -> work/ce_logit_{train,test}.npy  (aligned with ce_pairs_*.parquet, NaN = not scored)
+  python ce_train.py train A|B      fine-tune one half                 -> work/ce{TAG}_model_{A,B}.pt
+  python ce_train.py score [split]  -> work/ce{TAG}_logit_{train,test}.npy  (aligned with ce_pairs_*.parquet, NaN = not scored)
+  python ce_train.py adapt France   self-training for a country absent from training (see adapt())
+  python ce_train.py pack           -> work/ce_text_{train,test}.parquet: text of the entities in scored pairs, so the
+                                       GPU step can run on another machine without the raw files
 
-Env: ER_CE_MODEL (default intfloat/multilingual-e5-small; a local copy also works).
+Env: ER_CE_MODEL (default intfloat/multilingual-e5-small; a local copy also works),
+     ER_CE_TAG (output-name suffix for an additional cross-encoder, default ""),
+     ER_CE_NTRAIN (pairs per half-model, default 1,000,000; 0 = every scored-region pair of its folds).
+GPUs without bfloat16 (e.g. T4, P100) train in float16 with loss scaling.
 """
 import os
 import sys
@@ -31,11 +37,14 @@ from transformers import AutoModel, AutoTokenizer
 import config
 
 MODEL = os.environ.get("ER_CE_MODEL", "intfloat/multilingual-e5-small")
+TAG = os.environ.get("ER_CE_TAG", "")
 MAXLEN, LR, BATCH, SCORE_BATCH = 96, 5e-5, 128, 512
-N_TRAIN = 1_000_000                     # pairs per half-model (one epoch)
+N_TRAIN = int(os.environ.get("ER_CE_NTRAIN", 1_000_000))   # pairs per half-model (one epoch)
+ADAPT_LR, N_ADAPT, PSEUDO_HI, PSEUDO_LO = 2e-5, 300_000, 0.97, 0.03   # unseen-country self-training (ce_loco.py)
 P2_MAX = 0.999                          # pairs above this stage-2 probability hold no dev FN and 2.5% of FP: not scored
 HALVES = {"A": ((1, 2), (3, 4)), "B": ((3, 4), (1, 2))}   # name: (train folds, scored folds)
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+AMP = torch.bfloat16 if DEV.type == "cuda" and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
 
 class CrossEncoder(torch.nn.Module):
@@ -61,18 +70,39 @@ def load_pairs(split):
     P["k"] = np.arange(len(P))           # position in the exported file
     P = P[P.p2.values < P2_MAX].reset_index(drop=True)
     ids = pd.Index(pd.unique(np.concatenate([P.q_id.values, P.p_id.values])))
-    text = np.empty(len(ids), dtype=object)
-    for k in (1, 2, 3):
-        for ch in pd.read_csv(config.src_path(split, k), sep="\t", dtype=str, chunksize=1_000_000,
-                              usecols=["entity_id", "business_name", "business_address"]):
-            pos = ids.get_indexer(ch.entity_id.values)
-            m = pos >= 0
-            text[pos[m]] = (ch.business_name.fillna("").values[m] + " | " + ch.business_address.fillna("").values[m])
-    assert all(t is not None for t in text), "entity missing from the raw files"
+    text = texts(split, ids)
     P["qi"] = ids.get_indexer(P.q_id.values).astype(np.int32)
     P["h"] = (pd.util.hash_array(P.q_id.values) % 2).astype(np.int8)    # half-model for holdout/test pairs
     P["pi"] = ids.get_indexer(P.p_id.values).astype(np.int32)
     return P.drop(columns=["q_id", "p_id"]), text
+
+
+def texts(split, ids):
+    """ "name | address" per entity id, from the compact table written by pack() where it has them, else the raw TSVs."""
+    tp = config.work(f"ce_text_{split}.parquet")
+    text = (pd.read_parquet(tp).set_index("entity_id").text.reindex(ids).values if os.path.exists(tp)
+            else np.full(len(ids), None, dtype=object))
+    miss = np.flatnonzero(pd.isna(text))
+    if len(miss):
+        need = pd.Index(ids[miss])
+        for k in (1, 2, 3):
+            for ch in pd.read_csv(config.src_path(split, k), sep="\t", dtype=str, chunksize=1_000_000,
+                                  usecols=["entity_id", "business_name", "business_address"]):
+                pos = need.get_indexer(ch.entity_id.values)
+                m = pos >= 0
+                text[miss[pos[m]]] = (ch.business_name.fillna("").values[m] + " | " + ch.business_address.fillna("").values[m])
+    assert all(isinstance(t, str) for t in text), "entity missing from the text source"
+    return text
+
+
+def pack():
+    for split in ("train", "test"):
+        P = pd.read_parquet(config.work(f"ce_pairs_{split}.parquet"), columns=["q_id", "p_id", "p2"])
+        P = P[P.p2.values < P2_MAX]
+        ids = pd.Index(pd.unique(np.concatenate([P.q_id.values, P.p_id.values])))
+        pd.DataFrame({"entity_id": ids, "text": texts(split, ids)}).to_parquet(
+            config.work(f"ce_text_{split}.parquet"), index=False, compression="zstd")
+        print(f"{split}: {len(ids):,} entities packed", flush=True)
 
 
 def batches(tok, text, qi, pi, size):
@@ -97,16 +127,21 @@ def sample_train(P, folds, n, seed):
     cand = np.flatnonzero(P.fold.isin(folds).values)
     unc = cand[(P.p2.values[cand] > 0.02) & (P.p2.values[cand] < 0.98)]
     rest = np.setdiff1d(cand, unc)
+    if n <= 0 or n >= len(cand):                 # every pair of these folds
+        return rng.permutation(cand)
     n_unc = min(len(unc), int(n * 0.7))
     idx = np.concatenate([rng.choice(unc, n_unc, replace=False), rng.choice(rest, n - n_unc, replace=False)])
     return rng.permutation(idx)
 
 
-def fit(P, text, idx, seed=0, model_name=MODEL, light=False):
+def fit(P, text, idx, seed=0, model_name=MODEL, light=False, init=None, lr=LR):
+    """Fine-tune on rows idx of P (columns qi, pi, y); init = state_dict path to continue from."""
     torch.manual_seed(seed)
     tok = AutoTokenizer.from_pretrained(model_name)
     model = CrossEncoder(model_name, light).to(DEV)
-    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=LR, weight_decay=0.01)
+    if init:
+        model.load_state_dict(torch.load(init, map_location=DEV))
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=0.01)
     steps = (len(idx) + BATCH - 1) // BATCH
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, s / (0.03 * steps)) * max(0.0, (steps - s) / steps))
     # length bucketing: sort within chunks of 50 batches, then shuffle the batch order
@@ -118,14 +153,16 @@ def fit(P, text, idx, seed=0, model_name=MODEL, light=False):
     idx = np.concatenate([bl[j] for j in np.random.default_rng(seed).permutation(len(bl))])
     y = torch.tensor(P.y.values[idx], dtype=torch.float32)
     lossf = torch.nn.BCEWithLogitsLoss()
+    scaler = torch.amp.GradScaler(enabled=AMP == torch.float16)   # no-op under bfloat16
     model.train()
     t0, run = time.time(), 0.0
     for step, (s, b) in enumerate(batches(tok, text, P.qi.values[idx], P.pi.values[idx], BATCH)):
-        with torch.autocast(DEV.type, dtype=torch.bfloat16):
+        with torch.autocast(DEV.type, dtype=AMP):
             loss = lossf(model(**b).float(), y[s].to(DEV))
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step(); sched.step(); opt.zero_grad(set_to_none=True)
+        scaler.step(opt); scaler.update(); sched.step(); opt.zero_grad(set_to_none=True)
         run = 0.98 * run + 0.02 * loss.item() if step else loss.item()
         if step % 500 == 0 or step == steps - 1:
             print(f"  step {step}/{steps} loss {run:.4f} ({(step + 1) * BATCH / (time.time() - t0):.0f} pairs/s)", flush=True)
@@ -140,7 +177,7 @@ def score(model, tok, text, qi, pi):
     out = np.empty(len(qi), np.float32)
     t0 = time.time()
     for k, (s, b) in enumerate(batches(tok, text, qi[order], pi[order], SCORE_BATCH)):
-        with torch.autocast(DEV.type, dtype=torch.bfloat16):
+        with torch.autocast(DEV.type, dtype=AMP):
             out[order[s]] = model(**b).float().cpu().numpy()
         if k % 2000 == 0:
             print(f"  scored {s.stop:,}/{len(qi):,} ({s.stop / (time.time() - t0):.0f} pairs/s)", flush=True)
@@ -197,20 +234,64 @@ def pilot(models=(MODEL,), light=False):
 def train_half(name):
     P, text = load_pairs("train")
     model, _ = fit(P, text, sample_train(P, HALVES[name][0], N_TRAIN, {"A": 0, "B": 1}[name]))
-    torch.save(model.state_dict(), config.work(f"ce_model_{name}.pt"))
+    torch.save(model.state_dict(), config.work(f"ce{TAG}_model_{name}.pt"))
 
 
-def score_all():
+def adapt(country):
+    """Self-training for a country absent from training, validated by the India-as-unseen simulation
+    (ce_loco.py: +0.0121 India dev macro F0.5, also with the combiner frozen).  Each half-model continues
+    fine-tuning on confident final-model predictions for that country's test pairs (pseudo-labels: stage-3
+    probability >= PSEUDO_HI -> match, <= PSEUDO_LO -> non-match; no test label exists or is used), mixed
+    with labelled pairs of its own training folds.  That country's test pairs are then rescored by their
+    assigned half-model; every other score is unchanged.
+    Needs work/ce_pairs_test_p3.npy (ce_export.py p3).  Writes work/ce_<country>_model_{A,B}.pt and
+    work/ce_<country>_logit_test.npy (read by final2.py infer --ce-name ce_<country>)."""
+    name = f"ce_{country.lower()}"
+    Pt, text_te = load_pairs("test")
+    E = pd.read_parquet(config.work("ce_pairs_test.parquet"), columns=["q_id", "p2"])
+    q_id = E.q_id.values[E.p2.values < P2_MAX]                  # same filter and order as load_pairs
+    cty = pd.read_csv(config.src_path("test", 1), sep="\t", dtype=str, usecols=["entity_id", "country"])
+    mine = cty.set_index("entity_id").country.reindex(q_id).values == country
+    p3 = np.load(config.work("ce_pairs_test_p3.npy"))[Pt.k.values]
+    pseudo = np.flatnonzero(mine & ((p3 >= PSEUDO_HI) | (p3 <= PSEUDO_LO)))
+    print(f"{country}: {mine.sum():,} scored test pairs, pseudo-labelled {len(pseudo):,} "
+          f"({(p3[pseudo] >= PSEUDO_HI).sum():,} match / {(p3[pseudo] <= PSEUDO_LO).sum():,} non-match)", flush=True)
+    Ptr, text_tr = load_pairs("train")
+    text, off = np.concatenate([text_tr, text_te]), len(text_tr)
+    out = np.load(config.work(f"ce{TAG}_logit_test.npy"))
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    rng = np.random.default_rng(0)
+    for h, (folds, _) in HALVES.items():
+        w = config.work(f"{name}_model_{h}.pt")
+        if os.path.exists(w):
+            model = CrossEncoder().to(DEV)
+            model.load_state_dict(torch.load(w, map_location=DEV))
+        else:
+            pick = rng.choice(pseudo, min(N_ADAPT, len(pseudo)), replace=False)
+            lab = sample_train(Ptr, folds, N_ADAPT, {"A": 3, "B": 4}[h])
+            A = pd.DataFrame({"qi": np.r_[Pt.qi.values[pick] + off, Ptr.qi.values[lab]],
+                              "pi": np.r_[Pt.pi.values[pick] + off, Ptr.pi.values[lab]],
+                              "y": np.r_[(p3[pick] >= PSEUDO_HI).astype(np.int8), Ptr.y.values[lab]]})
+            model, _ = fit(A, text, rng.permutation(len(A)), {"A": 5, "B": 6}[h],
+                           init=config.work(f"ce{TAG}_model_{h}.pt"), lr=ADAPT_LR)
+            torch.save(model.state_dict(), w)
+        m = mine & (Pt.h.values == (0 if h == "A" else 1))
+        print(f"{country}: half-model {h} rescores {m.sum():,} pairs", flush=True)
+        out[Pt.k.values[m]] = score(model, tok, text_te, Pt.qi.values[m], Pt.pi.values[m])
+    np.save(config.work(f"{name}_logit_test.npy"), out)
+
+
+def score_all(splits=("train", "test")):
     """Score every exported pair with one half-model (see module doc).  Dev-fold scores already
     present in work/ce_logit_train.npy are reused; holdout and test pairs are always (re)scored."""
     tok = AutoTokenizer.from_pretrained(MODEL)
     models = {}
     for name in HALVES:
         m = CrossEncoder().to(DEV)
-        m.load_state_dict(torch.load(config.work(f"ce_model_{name}.pt"), map_location=DEV))
+        m.load_state_dict(torch.load(config.work(f"ce{TAG}_model_{name}.pt"), map_location=DEV))
         models[name] = m
-    for split in ("train", "test"):
-        path = config.work(f"ce_logit_{split}.npy")
+    for split in splits:
+        path = config.work(f"ce{TAG}_logit_{split}.npy")
         P, text = load_pairs(split)
         n_all = len(pd.read_parquet(config.work(f"ce_pairs_{split}.parquet"), columns=["p2"]))
         full = np.load(path) if os.path.exists(path) else np.full(n_all, np.nan, np.float32)  # NaN = not scored
@@ -233,4 +314,5 @@ if __name__ == "__main__":
     print(f"device {DEV} | model {MODEL}", flush=True)
     args = [x for x in sys.argv[2:] if not x.startswith("--")]
     {"pilot": lambda: pilot(tuple(args) or (MODEL,), "--light" in sys.argv),
-     "train": lambda: train_half(args[0]), "score": score_all}[cmd]()
+     "train": lambda: train_half(args[0]), "score": lambda: score_all(tuple(args) or ("train", "test")),
+     "pack": pack, "adapt": lambda: adapt(args[0])}[cmd]()

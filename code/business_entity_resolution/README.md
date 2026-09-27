@@ -65,8 +65,9 @@ then runs the official validator, which must print `PASS`.
 | holdout | `python main.py holdout` | score on the holdout fold 0 | 5 min |
 | fit | `python main.py fit` | stage-2 and stage-3 models on all training data | 30 min |
 | infer | `python main.py infer` | test: candidates/features if missing → stage 2 → pseudo-label adaptation for countries absent from training → stage 3 → decision policy → `output/*.tsv` → self-check + official validator | 30 min |
+| adapt | `python main.py adapt` | **unseen-country self-training** (GPU): export the final test probabilities of the CE pairs (`ce_export.py p3`); continue fine-tuning each half-model on confident French predictions (≥ 0.97 / ≤ 0.03) mixed with labelled pairs of its own folds (`ce_train.py adapt France`); rescore French pairs; infer again (`--ce-name ce_france`) → final `output/*.tsv` | ≈ 45 min GPU + 30 min CPU |
 
-The final configuration is **v3 + house-number relation features + cross-encoder, with an acceptance threshold of 0.9** (tags `inv3n` / `s3inv3n_ce`, policy `thr0.9`; public leaderboard **0.983**). v3 is v2 without two scale-shifted IDF features. The house-number features (`features_num.py`) separate neighbouring premises from corrupted house numbers. The cross-encoder (`ce_export.py`, `ce_train.py`, `final2.py --ce`) adds one stage-3 feature. The earlier v1 (`train.py --stack`, `final.py fit/infer`), v2 (`inv2` / `s3inv2`) and pre-CE (`s3inv3n`, leaderboard 0.977) configurations are kept for the ablation record.
+The final configuration is **v3 + house-number relation features + cross-encoder, with an acceptance threshold of 0.9** (tags `inv3n` / `s3inv3n_ce`, policy `thr0.9`, French test pairs scored by the self-trained cross-encoder `ce_france`; public leaderboard **0.983**). v3 is v2 without two scale-shifted IDF features. The house-number features (`features_num.py`) separate neighbouring premises from corrupted house numbers. The cross-encoder (`ce_export.py`, `ce_train.py`, `final2.py --ce`) adds one stage-3 feature. The earlier v1 (`train.py --stack`, `final.py fit/infer`), v2 (`inv2` / `s3inv2`) and pre-CE (`s3inv3n`, leaderboard 0.977) configurations are kept for the ablation record.
 
 **Analysis and diagnostic tools** (development only):
 
@@ -93,6 +94,9 @@ The final configuration is **v3 + house-number relation features + cross-encoder
 | `r4_audit.py` | R4 samples of residual house-number FN/FP pairs (no new features justified) |
 | `r5_check.py` | R5 fold-averaged test-time stage 2 (`exp.py --save-models`, `final2.py --s2-avg`) vs full model, KS distance to dev OOF (tested, not adopted) |
 | `ce_train.py pilot [model ...] [--light]` | cross-encoder pilots on a 200k-pair sample with pre-registered gates (single model vs stage 3; larger vs smaller model) |
+| `ce_loco.py` | unseen-country simulation (India held out, US-only stage 2 and cross-encoder) that validated the self-training of `ce_train.py adapt` |
+| `diag_residual.py` | residual loss of the final model: empty predictions by top-candidate probability, loss by S1 error kind |
+| `diag_france.py` | label-free confidence profile of France vs US/India on test, with uncertain French examples |
 | `ce_domain.py` | train-vs-test domain AUC with and without the CE logit, against reference pair features |
 | `ce_leak.py` | memorisation check: CE gain on records the scoring half-model saw in training vs never saw |
 | `bench_block.py`, `bench_miss.py` | blocking recall benchmark and miss analysis |
@@ -130,7 +134,8 @@ src/
   adapt.py           pseudo-label adaptation for unseen countries (+ LOCO simulation)
   decision.py        threshold / expected-F0.5 set selection, one-owner exclusivity
   ce_export.py       cross-encoder pair subset (stage-2 probability rule) → entity-id pair lists
-  ce_train.py        cross-encoder fine-tuning (2-way cross-fitting) and scoring, GPU
+  ce_train.py        cross-encoder fine-tuning (2-way cross-fitting), scoring, unseen-country self-training, GPU
+  ce_loco.py         unseen-country simulation for the self-training (India held out)
   evaluation.py      exact competition macro F0.5 + diagnostics, paired bootstrap
   error_analysis.py  error taxonomy + examples
   final.py           holdout evaluation (both versions); v1 fit/inference

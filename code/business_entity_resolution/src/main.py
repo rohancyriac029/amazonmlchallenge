@@ -11,6 +11,8 @@ data -> normalization -> blocking -> matching -> output.
   python main.py holdout    # score on the holdout fold (fold 0)
   python main.py fit        # final stage-2 + stage-3 models on all training data
   python main.py infer      # test inference -> output/matching_results.tsv, output/candidate_pairs.tsv + validator
+  python main.py adapt      # cross-encoder self-training for the country absent from training (France, GPU),
+                            # then test inference again with the adapted scores -> final output/*.tsv
 """
 import subprocess
 import sys
@@ -54,6 +56,12 @@ def main(stage):
         sh("final2.py", "fit", "--s2", S2, "--tag", TAG)
     if stage in ("infer", "all"):
         sh("final2.py", "infer", "--tag", TAG, "--policy", POLICY, "--adapt", "--final")
+    if stage in ("adapt", "all"):
+        # pseudo-labels = the confident test probabilities written by infer; method validated by ce_loco.py
+        # (India held out as the unseen country: +0.0121 macro F0.5)
+        sh("ce_export.py", "p3")
+        sh("ce_train.py", "adapt", "France")
+        sh("final2.py", "infer", "--tag", TAG, "--policy", POLICY, "--adapt", "--final", "--ce-name", "ce_france")
 
 
 if __name__ == "__main__":

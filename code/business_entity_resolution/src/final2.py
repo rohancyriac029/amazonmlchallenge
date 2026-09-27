@@ -44,10 +44,10 @@ def s2_spec(s2tag):
     return {"base_cols": [c for c in allc if c not in drop], "extra": rec.get("extra", ""), "params": rec.get("params", "default")}
 
 
-def ce_logit(split, n):
+def ce_logit(split, n, name="ce"):
     """Cross-encoder logit per pair of <split>_feat (NaN where the CE did not score; see ce_export/ce_train)."""
     v = np.full(n, np.nan, np.float32)
-    v[pd.read_parquet(config.work(f"ce_pairs_{split}.parquet"), columns=["row"]).row.values] =         np.load(config.work(f"ce_logit_{split}.npy"))
+    v[pd.read_parquet(config.work(f"ce_pairs_{split}.parquet"), columns=["row"]).row.values] =         np.load(config.work(f"{name}_logit_{split}.npy"))
     return v
 
 
@@ -171,7 +171,7 @@ def infer_cmd(a):
     if sp["no_comp"]:
         S = S.drop(columns=COMP_PROB)
     if sp.get("ce"):
-        S["ce_logit"] = ce_logit("test", len(S))
+        S["ce_logit"] = ce_logit("test", len(S), a.ce_name)
     X, _, cols3 = matrix("test_feat", spec, S)
     assert cols3 == sp["cols3"]
     meta["prob"] = lgb.Booster(model_file=config.work(f"stage3_{a.tag}.txt")).predict(X, num_threads=config.N_JOBS)
@@ -204,6 +204,7 @@ if __name__ == "__main__":
     ap.add_argument("--tag", default="s3inv2")
     ap.add_argument("--no-comp", action="store_true")
     ap.add_argument("--ce", action="store_true", help="add the cross-encoder logit to stage 3 (ce_export.py, ce_train.py)")
+    ap.add_argument("--ce-name", default="ce", help="infer: test CE logits work/<name>_logit_test.npy (e.g. ce_france)")
     ap.add_argument("--policy", default="expF_gate0.6")
     ap.add_argument("--adapt", action="store_true")
     ap.add_argument("--final", action="store_true", help="write to output/ instead of output/<tag>/")

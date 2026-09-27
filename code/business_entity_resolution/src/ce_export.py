@@ -6,6 +6,8 @@ p2 >= P2_MIN and within the top TOPK candidates of its S1 by p2.
 
   python ce_export.py diag      error coverage / size of candidate subset rules (dev folds only)
   python ce_export.py export    -> work/ce_pairs_{train,test}.parquet  (row, p2, entity ids; train also fold, y)
+  python ce_export.py p3        -> work/ce_pairs_test_p3.npy  final stage-3 test probability per exported pair
+                                   (pseudo-labels for ce_train.py adapt)
 """
 import sys
 
@@ -76,5 +78,10 @@ def export():
         print(f"{split}: {len(out):,} pairs exported")
 
 
+def p3(tag="s3inv3n_ce"):
+    rows = pd.read_parquet(config.work("ce_pairs_test.parquet"), columns=["row"]).row.values
+    np.save(config.work("ce_pairs_test_p3.npy"), np.load(config.work(f"test_prob_{tag}.npy"))[rows].astype(np.float32))
+
+
 if __name__ == "__main__":
-    {"diag": diag, "export": export}[sys.argv[1]]()
+    {"diag": diag, "export": export, "p3": p3}[sys.argv[1]]()
