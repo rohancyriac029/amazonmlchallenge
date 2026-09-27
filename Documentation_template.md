@@ -1,7 +1,7 @@
 # ML Challenge 2026: Business Entity Resolution Solution
 
-**Team Name:** [Your Team Name]  
-**Team Members:** [List all team members]  
+**Team Name:** The Segfault Society  
+**Team Members:** Rohan Cyriac Suraj (PES University, Bengaluru); Sanidhya Kumar (PES University, Bengaluru); Saksham Gupta (PES University Electronic City Campus, Bengaluru, Karnataka)  
 **Submission Date:** 2026-09-27
 
 ---
